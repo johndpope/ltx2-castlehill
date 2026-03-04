@@ -1,4 +1,39 @@
-# LTX-2
+# CastleHill: Separable Causal Diffusion for LTX-2
+
+**CastleHill** adds Separable Causal Diffusion (SCD) to [Lightricks/LTX-2](https://github.com/Lightricks/LTX-2) for long-form video generation (30s+) on consumer GPUs.
+
+SCD splits LTX-2's 48-layer DiT into an **encoder** (32 layers, run once per frame with KV-cache) and a **decoder** (16 layers, run N denoising steps per frame). This enables autoregressive generation — each new frame conditions on all previous frames via cached encoder features.
+
+## CastleHill Additions
+
+| Component | Location | Description |
+|-----------|----------|-------------|
+| `scd_model.py` | `ltx-core/.../transformer/` | SCD encoder/decoder wrapper |
+| `ddit.py` | `ltx-core/.../transformer/` | DDiT dynamic patch scheduling (optional) |
+| `scd_strategy.py` | `ltx-trainer/.../training_strategies/` | SCD training strategy |
+| `scd_inference.py` | `ltx-trainer/scripts/` | Autoregressive inference |
+| `bezierflow/` | `ltx-trainer/src/ltx_trainer/` | Learned sigma scheduler |
+| `ltx2_scd_*.yaml` | `ltx-trainer/configs/` | Training configurations |
+
+## SCD Quick Start
+
+```bash
+# Train SCD LoRA (token_concat + per-frame decoder)
+uv run python packages/ltx-trainer/scripts/train.py packages/ltx-trainer/configs/ltx2_scd_ditto.yaml
+
+# Generate 30s video
+python packages/ltx-trainer/scripts/scd_inference.py \
+    --cached-embedding /path/to/conditions_final/000.pt \
+    --num-seconds 30 --quantization int8-quanto \
+    --decoder-combine token_concat \
+    --output output.mp4
+```
+
+See [docs/scd-achievements.md](docs/scd-achievements.md) for full SCD documentation and benchmarks.
+
+---
+
+# LTX-2 (Upstream)
 
 [![Website](https://img.shields.io/badge/Website-LTX-181717?logo=google-chrome)](https://ltx.io)
 [![Model](https://img.shields.io/badge/HuggingFace-Model-orange?logo=huggingface)](https://huggingface.co/Lightricks/LTX-2)

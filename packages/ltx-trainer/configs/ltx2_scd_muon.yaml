@@ -1,0 +1,138 @@
+# =============================================================================
+# LTX-2 SCD LoRA — Muon Optimizer + Scheduled Sampling
+# =============================================================================
+#
+# Same as ltx2_scd_scheduled_sampling.yaml but with Muon optimizer.
+# Muon (Momentum + Newton-Schulz orthogonalization) normalizes weight
+# updates to be spectrally orthogonal → ~1.3-2x faster convergence.
+#
+# Resumes from the AdamW scheduled sampling checkpoint (step 400) to
+# compare Muon vs AdamW on identical data/curriculum.
+#
+# Key differences from AdamW config:
+#   - optimizer_type: "muon" (PyTorch 2.10 native)
+#   - learning_rate: 0.02 (Muon needs ~10-20x higher LR)
+#   - All LoRA params are 2D, so pure Muon (no AdamW fallback needed)
+#
+# Usage:
+#   cd ltx-trainer
+#   python3 scripts/train.py configs/ltx2_scd_muon.yaml
+#
+# =============================================================================
+
+# Model
+model:
+  model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+  load_checkpoint: "/media/2TB/omnitransfer/output/scd_scheduled_sampling/checkpoints/lora_weights_step_00400.safetensors"
+
+# LoRA — same config as the checkpoint we're resuming from
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+# Training strategy: SCD with per-frame decoder + scheduled sampling
+training_strategy:
+  name: "scd"
+  encoder_layers: 32
+  decoder_input_combine: "add"
+  per_frame_decoder: true
+  first_frame_conditioning_p: 0.5
+  with_audio: false
+  log_reconstructions: true
+  reconstruction_log_interval: 100
+  # Scheduled sampling config
+  scheduled_sampling: true
+  ss_p_ar_start: 0.0
+  ss_p_ar_end: 0.5
+  ss_warmup_steps: 50
+  ss_ramp_steps: 150
+  ss_noise_augment: 0.05
+
+# Optimization — Muon with higher LR
+optimization:
+  learning_rate: 0.02
+  steps: 400
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  max_grad_norm: 1.0
+  optimizer_type: "muon"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-4
+  weight_decay: 0.01
+  enable_gradient_checkpointing: true
+
+# Acceleration
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+# Hardware (dual GPU)
+hardware:
+  devices:
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+# Data
+data:
+  preprocessed_data_root: "/media/2TB/omnitransfer/data/ditto_subset"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+# Validation — disabled (use SCD inference script for quality checks)
+validation:
+  prompts: []
+  negative_prompt: "blurry, distorted, low quality"
+  video_dims: [768, 448, 25]
+  frame_rate: 20.0
+  seed: 42
+  inference_steps: 12
+  interval: null
+  videos_per_prompt: 1
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_v"
+  generate_audio: false
+  skip_initial_validation: true
+
+# Checkpoints
+checkpoints:
+  interval: 100
+  keep_last_n: 4
+
+# Flow Matching
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+# Hub
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+# Weights & Biases
+wandb:
+  enabled: true
+  project: "scd-muon"
+  entity: null
+  tags: ["scd", "muon", "scheduled-sampling", "ar-aware", "fine-tune", "distilled", "per-frame"]
+  log_validation_videos: false
+
+# General
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/scd_muon"

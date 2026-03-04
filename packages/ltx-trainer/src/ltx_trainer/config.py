@@ -7,6 +7,7 @@ from ltx_trainer.quantization import QuantizationOptions
 from ltx_trainer.training_strategies.base_strategy import TrainingStrategyConfigBase
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig
+from ltx_trainer.training_strategies.scd_strategy import SCDTrainingConfig
 
 
 class ConfigBaseModel(BaseModel):
@@ -89,7 +90,9 @@ def _get_strategy_discriminator(v: dict | TrainingStrategyConfigBase) -> str:
 
 # Union type for all strategy configs with discriminator
 TrainingStrategyConfig = Annotated[
-    Annotated[TextToVideoConfig, Tag("text_to_video")] | Annotated[VideoToVideoConfig, Tag("video_to_video")],
+    Annotated[TextToVideoConfig, Tag("text_to_video")]
+    | Annotated[VideoToVideoConfig, Tag("video_to_video")]
+    | Annotated[SCDTrainingConfig, Tag("scd")],
     Discriminator(_get_strategy_discriminator),
 ]
 
@@ -122,7 +125,7 @@ class OptimizationConfig(ConfigBaseModel):
         description="Maximum gradient norm for clipping",
     )
 
-    optimizer_type: Literal["adamw", "adamw8bit"] = Field(
+    optimizer_type: Literal["adamw", "adamw8bit", "muon"] = Field(
         default="adamw",
         description="Type of optimizer to use for training",
     )
@@ -141,6 +144,20 @@ class OptimizationConfig(ConfigBaseModel):
     scheduler_params: dict = Field(
         default_factory=dict,
         description="Parameters for the scheduler",
+    )
+
+    weight_decay: float = Field(
+        default=0.0,
+        description="Weight decay (L2 regularization) for AdamW optimizer. "
+        "Recommended 1e-4 to 1e-2 for small datasets to prevent overfitting.",
+        ge=0.0,
+    )
+
+    warmup_steps: int = Field(
+        default=0,
+        description="Number of linear warmup steps before the main scheduler kicks in. "
+        "Useful for stabilizing Muon with token_concat (doubled sequence length).",
+        ge=0,
     )
 
     enable_gradient_checkpointing: bool = Field(
@@ -181,6 +198,24 @@ class DataConfig(ConfigBaseModel):
         ge=0,
     )
 
+    use_cached_final_embeddings: bool = Field(
+        default=False,
+        description="Use pre-computed final embeddings (post-connector) from conditions_final/. "
+        "When True, skips loading text encoder entirely, saving ~28GB VRAM. "
+        "Requires running compute_final_embeddings.py first.",
+    )
+
+    final_embeddings_dir: str = Field(
+        default="conditions_final",
+        description="Directory name for cached final embeddings (relative to preprocessed_data_root)",
+    )
+
+    live_ingest_enabled: bool = Field(
+        default=False,
+        description="Enable live dataset hot-reload. When True, the trainer rescans the dataset "
+        "directory at each epoch boundary for new .pt files added by live_ingest.py.",
+    )
+
 
 class ValidationConfig(ConfigBaseModel):
     """Configuration for validation during training"""
@@ -205,14 +240,6 @@ class ValidationConfig(ConfigBaseModel):
         default=None,
         description="List of reference video paths to use for validation. "
         "One video path must be provided for each validation prompt",
-    )
-
-    reference_downscale_factor: int = Field(
-        default=1,
-        description="Downscale factor for reference videos in IC-LoRA validation. "
-        "When > 1, reference videos are processed at 1/n resolution (e.g., 2 means half resolution). "
-        "Must match the factor used during dataset preprocessing.",
-        ge=1,
     )
 
     video_dims: tuple[int, int, int] = Field(
@@ -342,41 +369,6 @@ class ValidationConfig(ConfigBaseModel):
 
         return v
 
-    @model_validator(mode="after")
-    def validate_scaled_reference_dimensions(self) -> "ValidationConfig":
-        """Validate that scaled reference dimensions are valid when reference_downscale_factor > 1."""
-        if self.reference_downscale_factor > 1:
-            width, height, _frames = self.video_dims
-
-            # Validate that downscale factor evenly divides the target dimensions
-            if width % self.reference_downscale_factor != 0:
-                raise ValueError(
-                    f"Width {width} is not evenly divisible by reference_downscale_factor "
-                    f"{self.reference_downscale_factor}. Choose a downscale factor that divides {width} evenly."
-                )
-            if height % self.reference_downscale_factor != 0:
-                raise ValueError(
-                    f"Height {height} is not evenly divisible by reference_downscale_factor "
-                    f"{self.reference_downscale_factor}. Choose a downscale factor that divides {height} evenly."
-                )
-
-            scaled_width = width // self.reference_downscale_factor
-            scaled_height = height // self.reference_downscale_factor
-
-            # Validate scaled dimensions are divisible by 32
-            if scaled_width % 32 != 0:
-                raise ValueError(
-                    f"Scaled reference width {scaled_width} (from {width} / {self.reference_downscale_factor}) "
-                    f"is not divisible by 32. Choose a different downscale factor or adjust video_dims."
-                )
-            if scaled_height % 32 != 0:
-                raise ValueError(
-                    f"Scaled reference height {scaled_height} (from {height} / {self.reference_downscale_factor}) "
-                    f"is not divisible by 32. Choose a different downscale factor or adjust video_dims."
-                )
-
-        return self
-
 
 class CheckpointsConfig(ConfigBaseModel):
     """Configuration for model checkpointing during training"""
@@ -458,6 +450,58 @@ class FlowMatchingConfig(ConfigBaseModel):
     )
 
 
+class HardwareDevicesConfig(ConfigBaseModel):
+    """Device assignments for multi-GPU setups.
+
+    Example for RTX 4000 (24GB) + RTX 5090 (32GB):
+        text_encoder: "cuda:0"    # RTX 4000 - Gemma (~13GB in 8-bit)
+        vae_encoder: "cuda:0"     # RTX 4000 - VAE encoding
+        vae_decoder: "cuda:0"     # RTX 4000 - VAE decoding
+        transformer: "cuda:1"     # RTX 5090 - 19B transformer training
+        audio_vae: "cuda:0"       # RTX 4000 - Audio components
+        vocoder: "cuda:0"
+    """
+
+    text_encoder: str = Field(
+        default="cuda:0",
+        description="Device for text encoder (Gemma)",
+    )
+    vae_encoder: str = Field(
+        default="cuda:0",
+        description="Device for VAE encoder",
+    )
+    vae_decoder: str = Field(
+        default="cuda:0",
+        description="Device for VAE decoder",
+    )
+    transformer: str = Field(
+        default="cuda:0",
+        description="Device for transformer (training)",
+    )
+    audio_vae: str = Field(
+        default="cuda:0",
+        description="Device for audio VAE",
+    )
+    vocoder: str = Field(
+        default="cuda:0",
+        description="Device for vocoder",
+    )
+
+
+class HardwareConfig(ConfigBaseModel):
+    """Hardware profile configuration for multi-GPU setups.
+
+    Use this to split model components across multiple GPUs:
+    - Put memory-hungry frozen models (text encoder, VAE) on one GPU
+    - Put the training transformer on the larger GPU
+    """
+
+    devices: HardwareDevicesConfig = Field(
+        default_factory=HardwareDevicesConfig,
+        description="Device assignments for each model component",
+    )
+
+
 class LtxTrainerConfig(ConfigBaseModel):
     """Unified configuration for LTXV training"""
 
@@ -476,6 +520,7 @@ class LtxTrainerConfig(ConfigBaseModel):
     hub: HubConfig = Field(default_factory=HubConfig)
     flow_matching: FlowMatchingConfig = Field(default_factory=FlowMatchingConfig)
     wandb: WandbConfig = Field(default_factory=WandbConfig)
+    hardware: HardwareConfig = Field(default_factory=HardwareConfig)
 
     # General configuration
     seed: int = Field(

@@ -1,0 +1,149 @@
+# =============================================================================
+# LTX-2 SCD LoRA — Token Concat (Paper's Best Combine Mode)
+# =============================================================================
+#
+# Retrains SCD from scratch with token_concat (Table 3 best mode).
+# Previous training used "add" mode which has NO learned alignment between
+# encoder features and decoder tokens → mush output at inference.
+#
+# token_concat prepends encoder features as prefix tokens:
+#   decoder_input = [encoder_features; noisy_tokens]  → 2× sequence length
+# The decoder's self-attention then attends to BOTH, allowing rich interaction.
+#
+# With per_frame_decoder=true, per-frame tokens = 336→672 (manageable on 32GB).
+# Multi-frame would be 1344→2688 (OOM risk).
+#
+# Usage:
+#   cd ltx-trainer
+#   python3 scripts/train.py configs/ltx2_scd_token_concat.yaml
+#
+# Inference:
+#   python scripts/scd_inference.py \
+#     --distilled --decoder-combine token_concat \
+#     --lora-path /media/2TB/omnitransfer/output/scd_token_concat/checkpoints/lora_weights_step_01000.safetensors \
+#     --cached-embedding /media/2TB/omnitransfer/data/ditto_subset/conditions_final/000000.pt \
+#     --num-seconds 5 --output /media/2TB/omnitransfer/inference/scd_tc.mp4
+#
+# =============================================================================
+
+# Model — distilled for fast inference
+model:
+  model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+  # Fresh start with AdamW (Muon run produced noise)
+  # load_checkpoint: null
+
+# LoRA
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+# Training strategy: SCD with token_concat (paper's best, Table 3)
+training_strategy:
+  name: "scd"
+  encoder_layers: 32
+  decoder_input_combine: "token_concat"   # Paper's best mode (was "add" — caused mush)
+  per_frame_decoder: true                 # 672 tokens/frame (not 2688 multi-frame)
+  first_frame_conditioning_p: 0.5
+  with_audio: false
+  log_reconstructions: true
+  reconstruction_log_interval: 100
+  # Scheduled sampling — start moderate, ramp up
+  scheduled_sampling: true
+  ss_p_ar_start: 0.0
+  ss_p_ar_end: 0.5
+  ss_warmup_steps: 50
+  ss_ramp_steps: 300
+  ss_noise_augment: 0.05
+
+# Optimization — Muon (stabilized: lower lr + warmup for token_concat)
+# Previous Muon lr=0.02 produced noise — token_concat doubles sequence (672 tokens),
+# changing loss landscape. lr=0.005 with 100-step warmup lets Newton-Schulz estimates
+# calibrate before aggressive updates.
+optimization:
+  learning_rate: 0.005
+  steps: 2000
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  max_grad_norm: 1.0
+  optimizer_type: "muon"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 100
+  enable_gradient_checkpointing: true
+
+# Acceleration
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+# Hardware (dual GPU)
+hardware:
+  devices:
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+# Data — Ditto-1M subset (500 diverse pairs)
+data:
+  preprocessed_data_root: "/media/2TB/omnitransfer/data/ditto_subset"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+# Validation — disabled
+validation:
+  prompts: []
+  negative_prompt: "blurry, distorted, low quality"
+  video_dims: [768, 448, 25]
+  frame_rate: 20.0
+  seed: 42
+  inference_steps: 12
+  interval: null
+  videos_per_prompt: 1
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_v"
+  generate_audio: false
+  skip_initial_validation: true
+
+# Checkpoints
+checkpoints:
+  interval: 200
+  keep_last_n: 6
+
+# Flow Matching
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+# Hub
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+# Weights & Biases
+wandb:
+  enabled: true
+  project: "scd-token-concat"
+  entity: null
+  tags: ["scd", "token-concat", "muon", "per-frame", "distilled", "scheduled-sampling", "stabilized-lr"]
+  log_validation_videos: false
+
+# General
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/scd_token_concat"

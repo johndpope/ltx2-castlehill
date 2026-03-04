@@ -1,0 +1,134 @@
+# =============================================================================
+# LTX-2 SCD LoRA Training — Distilled-Isometric Base Model
+# =============================================================================
+#
+# Train SCD encoder/decoder split LoRA on the distilled-isometric model
+# (distilled base + merged T2I isometric LoRA at alpha=0.7).
+#
+# Uses 33 Scrya isometric videos (480x704, 25 frames) — lady/woman filtered.
+# Small dataset but same-domain: good for isometric style, but watch for
+# autoregressive drift at inference beyond ~10-15 seconds.
+#
+# SCD Architecture:
+#   - Encoder: 32 layers, sees clean signal at t=0 with causal frame mask
+#   - Decoder: 16 layers, denoises with actual noise + shifted encoder features
+#   - Combine mode: "add" (token_concat doubles sequence → OOM at 720p)
+#
+# With 33 samples, batch_size=1, grad_accum=4:
+#   effective_batch = 4, steps_per_epoch = 33/4 ≈ 8
+#   2000 steps ≈ 242 epochs
+#
+# Usage:
+#   cd ltx-trainer
+#   python scripts/train.py configs/ltx2_scd_distilled_isometric.yaml
+#
+# =============================================================================
+
+# Model — distilled-isometric (merged T2I LoRA into distilled base)
+model:
+  model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled-isometric.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+  load_checkpoint: null
+
+# LoRA — rank 32 matches previous SCD training
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+# Training strategy: SCD
+training_strategy:
+  name: "scd"
+  encoder_layers: 32               # 32 encoder + 16 decoder = 48 total
+  decoder_input_combine: "add"     # Simple addition — lower VRAM than token_concat
+  first_frame_conditioning_p: 0.5  # 50% I2V mode, 50% pure T2V
+  with_audio: false
+  log_reconstructions: true
+  reconstruction_log_interval: 200
+
+# Optimization
+optimization:
+  learning_rate: 1.0e-4
+  steps: 2000
+  batch_size: 1
+  gradient_accumulation_steps: 4   # Effective batch = 4 (small dataset)
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-6
+  weight_decay: 0.01
+  enable_gradient_checkpointing: true
+
+# Acceleration
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"      # Reliable — fp8-quanto has JIT compile issues
+  load_text_encoder_in_8bit: true
+
+# Hardware (dual GPU)
+hardware:
+  devices:
+    text_encoder: "cuda:1"         # RTX PRO 4000 (24GB)
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"          # RTX 5090 (32GB) — main training
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+# Data — 33 Scrya isometric videos (filtered, 480x704, 25 frames)
+data:
+  preprocessed_data_root: "/media/2TB/omnitransfer/data/isometric_scd_v2"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+# Validation — disabled (cached embeddings, no live text encoder)
+validation:
+  prompts: []
+  negative_prompt: "blurry, distorted, low quality"
+  video_dims: [768, 1152, 25]
+  frame_rate: 24.0
+  seed: 42
+  inference_steps: 8
+  interval: null
+  videos_per_prompt: 1
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_v"
+  generate_audio: false
+  skip_initial_validation: true
+
+# Checkpoints
+checkpoints:
+  interval: 500
+  keep_last_n: 4
+
+# Flow Matching
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+# Hub
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+# Weights & Biases
+wandb:
+  enabled: true
+  project: "scd-distilled-isometric"
+  entity: null
+  tags: ["scd", "distilled", "isometric", "scrya-33", "lora", "merged-base", "480x704"]
+  log_validation_videos: false
+
+# General
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/scd_distilled_isometric"

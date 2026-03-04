@@ -1,0 +1,140 @@
+# =============================================================================
+# LTX-2 SCD LoRA — Muon V2 (Resume from step 400 + Higher AR Exposure)
+# =============================================================================
+#
+# Continues Muon training from the step 400 checkpoint.
+# Key changes from V1:
+#   - Resumes from Muon step 400 (not AdamW step 400)
+#   - Higher ss_p_ar_end (0.7 vs 0.5) — model is warmed up, push harder
+#   - Shorter warmup (20 steps vs 50) since model already knows SCD
+#   - 600 more steps (effective total: 400 AdamW + 400 Muon + 600 Muon V2)
+#   - Lower LR start (0.01) — fine-tune, not learn from scratch
+#
+# After training, test with BézierFlow schedule:
+#   python scripts/scd_inference.py \
+#     --distilled --bezier-schedule /media/2TB/omnitransfer/output/bezierflow/schedule.pt \
+#     --lora-path /media/2TB/omnitransfer/output/scd_muon_v2/checkpoints/lora_weights_step_00600.safetensors \
+#     --num-inference-steps 4 ...
+#
+# Usage:
+#   cd ltx-trainer
+#   python3 scripts/train.py configs/ltx2_scd_muon_v2.yaml
+#
+# =============================================================================
+
+# Model
+model:
+  model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+  load_checkpoint: "/media/2TB/omnitransfer/output/scd_muon/checkpoints/lora_weights_step_00400.safetensors"
+
+# LoRA — same config as the checkpoint
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+# Training strategy: SCD with per-frame decoder + aggressive scheduled sampling
+training_strategy:
+  name: "scd"
+  encoder_layers: 32
+  decoder_input_combine: "add"
+  per_frame_decoder: true
+  first_frame_conditioning_p: 0.5
+  with_audio: false
+  log_reconstructions: true
+  reconstruction_log_interval: 100
+  # Scheduled sampling — more aggressive since model is pre-trained
+  scheduled_sampling: true
+  ss_p_ar_start: 0.3
+  ss_p_ar_end: 0.7
+  ss_warmup_steps: 20
+  ss_ramp_steps: 200
+  ss_noise_augment: 0.03
+
+# Optimization — Muon with slightly lower LR for fine-tuning
+optimization:
+  learning_rate: 0.01
+  steps: 600
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  max_grad_norm: 1.0
+  optimizer_type: "muon"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-4
+  weight_decay: 0.01
+  enable_gradient_checkpointing: true
+
+# Acceleration
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+# Hardware (dual GPU)
+hardware:
+  devices:
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+# Data
+data:
+  preprocessed_data_root: "/media/2TB/omnitransfer/data/ditto_subset"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+# Validation — disabled
+validation:
+  prompts: []
+  negative_prompt: "blurry, distorted, low quality"
+  video_dims: [768, 448, 25]
+  frame_rate: 20.0
+  seed: 42
+  inference_steps: 12
+  interval: null
+  videos_per_prompt: 1
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_v"
+  generate_audio: false
+  skip_initial_validation: true
+
+# Checkpoints
+checkpoints:
+  interval: 100
+  keep_last_n: 6
+
+# Flow Matching
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+# Hub
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+# Weights & Biases
+wandb:
+  enabled: true
+  project: "scd-muon"
+  entity: null
+  tags: ["scd", "muon-v2", "scheduled-sampling", "ar-aware", "fine-tune", "distilled", "per-frame", "bezierflow"]
+  log_validation_videos: false
+
+# General
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/scd_muon_v2"

@@ -1,0 +1,143 @@
+# =============================================================================
+# LTX-2 SCD LoRA — AR-Aware Scheduled Sampling Fine-Tuning
+# =============================================================================
+#
+# Resumes from the per-frame decoder LoRA checkpoint and adds scheduled
+# sampling to close the teacher-forcing / autoregressive inference gap.
+#
+# During training, the encoder normally sees clean GT latents (sigma=0).
+# But at inference, the encoder sees model predictions from previous frames.
+# Scheduled sampling probabilistically replaces GT encoder inputs with the
+# model's own x_hat_0 predictions, following a warmup+ramp curriculum.
+#
+# Curriculum:
+#   Steps 0-49:   Pure teacher forcing (p_ar = 0.0)
+#   Steps 50-199: Linear ramp (p_ar: 0.0 -> 0.5)
+#   Steps 200+:   Plateau (p_ar = 0.5)
+#
+# Base: ltx-2-19b-distilled.safetensors
+# Resume: scd_distilled_perframe LoRA @ step 2000
+# Data: Ditto-1M subset (500 diverse pairs)
+#
+# Usage:
+#   cd ltx-trainer
+#   python3 scripts/train.py configs/ltx2_scd_scheduled_sampling.yaml
+#
+# =============================================================================
+
+# Model
+model:
+  model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+  load_checkpoint: "/media/2TB/omnitransfer/output/scd_distilled_perframe/checkpoints/lora_weights_step_02000.safetensors"
+
+# LoRA — same config as the checkpoint we're resuming from
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+# Training strategy: SCD with per-frame decoder + scheduled sampling
+training_strategy:
+  name: "scd"
+  encoder_layers: 32
+  decoder_input_combine: "add"
+  per_frame_decoder: true
+  first_frame_conditioning_p: 0.5
+  with_audio: false
+  log_reconstructions: true
+  reconstruction_log_interval: 100
+  # Scheduled sampling config
+  scheduled_sampling: true
+  ss_p_ar_start: 0.0
+  ss_p_ar_end: 0.5
+  ss_warmup_steps: 50
+  ss_ramp_steps: 150
+  ss_noise_augment: 0.05
+
+# Optimization — lower LR for fine-tuning an existing LoRA
+optimization:
+  learning_rate: 5.0e-5
+  steps: 400
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-6
+  weight_decay: 0.01
+  enable_gradient_checkpointing: true
+
+# Acceleration
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "fp8-quanto"
+  load_text_encoder_in_8bit: true
+
+# Hardware (dual GPU)
+hardware:
+  devices:
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+# Data
+data:
+  preprocessed_data_root: "/media/2TB/omnitransfer/data/ditto_subset"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+# Validation — disabled (use SCD inference script for quality checks)
+validation:
+  prompts: []
+  negative_prompt: "blurry, distorted, low quality"
+  video_dims: [768, 448, 25]
+  frame_rate: 20.0
+  seed: 42
+  inference_steps: 12
+  interval: null
+  videos_per_prompt: 1
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_v"
+  generate_audio: false
+  skip_initial_validation: true
+
+# Checkpoints
+checkpoints:
+  interval: 100
+  keep_last_n: 4
+
+# Flow Matching
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+# Hub
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+# Weights & Biases
+wandb:
+  enabled: true
+  project: "scd-scheduled-sampling"
+  entity: null
+  tags: ["scd", "scheduled-sampling", "ar-aware", "fine-tune", "distilled", "per-frame"]
+  log_validation_videos: false
+
+# General
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/scd_scheduled_sampling"

@@ -1,0 +1,132 @@
+# =============================================================================
+# LTX-2 SCD LoRA Training — Isometric Grok Videos (Overfitting)
+# =============================================================================
+#
+# Overfit SCD LoRA on 50 filtered isometric Grok videos (464×688 portrait).
+# Filtered: removed 72 person-posing-on-background videos.
+# The model learns autoregressive generation of isometric 3D animations
+# conditioned on scene+action text prompts.
+#
+# SCD Architecture:
+#   - Encoder: 32 layers, sees clean signal at t=0 with causal frame mask
+#   - Decoder: 16 layers, denoises with actual noise + shifted encoder features
+#   - First frame conditioning gives I2V-style visual grounding
+#
+# Prerequisites:
+#   1. Run caption_first_frames.py → _combined.txt files
+#   2. Run preprocess_isometric_scd.py → latents/ + conditions_final/
+#
+# Usage:
+#   cd ltx-trainer
+#   uv run python scripts/train.py configs/ltx2_scd_isometric.yaml
+#
+# =============================================================================
+
+# Model
+model:
+  model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-dev.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+  load_checkpoint: null
+
+# LoRA — rank 64 for overfitting capacity (higher than Ditto's 32)
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+# Training strategy: SCD
+training_strategy:
+  name: "scd"
+  encoder_layers: 32               # ~2:1 encoder:decoder ratio (48 total)
+  decoder_input_combine: "add"     # Simple addition — lower VRAM than token_concat
+  first_frame_conditioning_p: 0.5  # 50% I2V mode, 50% pure T2V
+  with_audio: false
+  log_reconstructions: true
+  reconstruction_log_interval: 100
+
+# Optimization — overfitting settings (higher LR, more steps)
+optimization:
+  learning_rate: 2.0e-4            # Higher LR for overfitting
+  steps: 3000                      # ~45 epochs over 67 filtered samples
+  batch_size: 1
+  gradient_accumulation_steps: 4   # Effective batch = 4 (smaller for overfit)
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-6
+  weight_decay: 0.01
+  enable_gradient_checkpointing: true
+
+# Acceleration
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+# Hardware (dual GPU)
+hardware:
+  devices:
+    text_encoder: "cuda:1"         # RTX PRO 4000 (24GB)
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"          # RTX 5090 (32GB) — main training
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+# Data — preprocessed isometric dataset
+data:
+  preprocessed_data_root: "/media/2TB/omnitransfer/data/isometric_scd_v2"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+# Validation — disabled (using cached embeddings)
+validation:
+  prompts: []
+  negative_prompt: "blurry, distorted, low quality"
+  video_dims: [480, 704, 25]       # Match training resolution (portrait)
+  frame_rate: 24.0
+  seed: 42
+  inference_steps: 30
+  interval: null
+  videos_per_prompt: 1
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_v"
+  generate_audio: false
+  skip_initial_validation: true
+
+# Checkpoints
+checkpoints:
+  interval: 500
+  keep_last_n: 5
+
+# Flow Matching
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+# Hub
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+# Weights & Biases
+wandb:
+  enabled: true
+  project: "scd-isometric-overfit"
+  entity: null
+  tags: ["scd", "isometric", "grok", "overfit", "lora"]
+  log_validation_videos: false
+
+# General
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/scd_isometric_v2"
