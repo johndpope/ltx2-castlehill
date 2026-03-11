@@ -496,6 +496,80 @@ class LTXSCDModel(nn.Module):
                 f"Unknown decoder_input_combine: {self.decoder_input_combine}"
             )
 
+    def forward_decoder_per_frame(
+        self,
+        video: Modality | None,
+        encoder_features: Tensor | None,
+        perturbations: BatchedPerturbationConfig | None,
+        tokens_per_frame: int = 336,
+        num_frames: int = 1,
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """Run decoder one frame at a time, matching autoregressive inference.
+
+        This prevents the train/inference attention scope mismatch that causes
+        grid artifacts when the decoder LoRA is trained on multi-frame input
+        but used on single-frame input at inference.
+
+        Each frame is decoded independently: the decoder sees only that frame's
+        noisy tokens and the corresponding shifted encoder features.
+
+        Args:
+            video: Full video modality with all frames' noisy tokens
+            encoder_features: Shifted encoder features [B, total_seq, D]
+            perturbations: Optional perturbation config
+            tokens_per_frame: Spatial tokens per frame (H * W)
+            num_frames: Number of frames in the video
+
+        Returns:
+            Tuple of (video_pred, audio_pred) concatenated across all frames
+        """
+        if video is None:
+            return None, None
+
+        all_video_preds = []
+        tpf = tokens_per_frame
+
+        for f in range(num_frames):
+            start = f * tpf
+            end = start + tpf
+
+            # Extract single frame's data from full video modality
+            frame_latent = video.latent[:, start:end, :]
+            frame_timesteps = video.timesteps[:, start:end] if video.timesteps.ndim > 1 else video.timesteps
+
+            # Extract frame's positional embeddings
+            if video.positions is not None:
+                frame_positions = video.positions[:, :, start:end, :]
+            else:
+                frame_positions = None
+
+            frame_modality = Modality(
+                enabled=video.enabled,
+                latent=frame_latent,
+                timesteps=frame_timesteps,
+                positions=frame_positions,
+                context=video.context,
+                context_mask=video.context_mask,
+            )
+
+            # Extract frame's encoder features
+            frame_enc = encoder_features[:, start:end, :] if encoder_features is not None else None
+
+            # Decode single frame
+            vx, ax = self.forward_decoder(
+                video=frame_modality,
+                encoder_features=frame_enc,
+                audio=None,
+                perturbations=perturbations,
+            )
+
+            if vx is not None:
+                all_video_preds.append(vx)
+
+        # Concatenate all frames
+        video_pred = torch.cat(all_video_preds, dim=1) if all_video_preds else None
+        return video_pred, None
+
     def forward(
         self,
         video: Modality | None,

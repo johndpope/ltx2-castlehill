@@ -652,9 +652,10 @@ class LtxvTrainer:
             logger.info(f"Moving {model_size} transformer to {hw_devices.transformer}...")
             self._transformer = self._transformer.to(hw_devices.transformer)
 
-        # Wrap transformer with SCD model if using SCD strategy (includes EditCtrl+SCD)
+        # Wrap transformer with SCD model if using SCD or VFM-SCD strategy
         from ltx_trainer.training_strategies.scd_strategy import SCDTrainingStrategy  # noqa: PLC0415
-        if isinstance(self._training_strategy, SCDTrainingStrategy):
+        from ltx_trainer.training_strategies.vfm_scd_strategy import VFMSCDTrainingStrategy  # noqa: PLC0415
+        if isinstance(self._training_strategy, (SCDTrainingStrategy, VFMSCDTrainingStrategy)):
             from ltx_core.model.transformer.scd_model import LTXSCDModel  # noqa: PLC0415
             scd_config = self._training_strategy.config
             # Pass EditCtrl local control injection config if available
@@ -672,6 +673,25 @@ class LtxvTrainer:
                 f"SCD wrapper: {scd_config.encoder_layers} encoder layers, "
                 f"{len(self._transformer.decoder_blocks)} decoder layers, "
                 f"combine={scd_config.decoder_input_combine}"
+            )
+
+        # VFM: Create noise adapter and attach to strategy
+        self._noise_adapter = None
+        if isinstance(self._training_strategy, VFMSCDTrainingStrategy):
+            from ltx_core.model.transformer.noise_adapter import create_noise_adapter  # noqa: PLC0415
+            adapter_kwargs = self._training_strategy.get_noise_adapter_params()
+            self._noise_adapter = create_noise_adapter(**adapter_kwargs)
+            # Move adapter to same device as transformer
+            adapter_device = next(self._transformer.parameters()).device
+            self._noise_adapter = self._noise_adapter.to(adapter_device)
+            self._training_strategy.set_noise_adapter(self._noise_adapter)
+
+            adapter_params = sum(p.numel() for p in self._noise_adapter.parameters())
+            logger.info(
+                f"VFM noise adapter: {adapter_kwargs['variant']}, "
+                f"{adapter_params:,} params, "
+                f"hidden_dim={adapter_kwargs['hidden_dim']}, "
+                f"layers={adapter_kwargs['num_layers']}"
             )
 
         # Placeholder for optional modules (EditCtrl, TMA — not included in CastleHill)
@@ -733,6 +753,14 @@ class LtxvTrainer:
             logger.info(
                 f"Added {len(strategy_params)} strategy parameters "
                 f"({sum(p.numel() for p in strategy_params):,} total)"
+            )
+
+        # VFM: Add noise adapter parameters to trainable params
+        if self._noise_adapter is not None:
+            adapter_params = list(self._noise_adapter.parameters())
+            self._trainable_params.extend(adapter_params)
+            logger.info(
+                f"Added VFM noise adapter: {sum(p.numel() for p in adapter_params):,} params"
             )
 
         total_params = sum(p.numel() for p in self._trainable_params)

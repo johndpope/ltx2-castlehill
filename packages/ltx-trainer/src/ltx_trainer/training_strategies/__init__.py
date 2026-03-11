@@ -3,6 +3,7 @@ This package implements the Strategy Pattern to handle different training modes:
 - Text-to-video training (standard generation, optionally with audio)
 - Video-to-video training (IC-LoRA mode with reference videos)
 - SCD training (Separable Causal Diffusion for long-form video)
+- VFM-SCD training (Variational Flow Maps + SCD for one-step conditional generation)
 Each strategy encapsulates the specific logic for preparing model inputs and computing loss.
 """
 
@@ -17,9 +18,10 @@ from ltx_trainer.training_strategies.base_strategy import (
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig, TextToVideoStrategy
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig, VideoToVideoStrategy
 from ltx_trainer.training_strategies.scd_strategy import SCDTrainingConfig, SCDTrainingStrategy
+from ltx_trainer.training_strategies.vfm_scd_strategy import VFMSCDTrainingConfig, VFMSCDTrainingStrategy
 
 # Type alias for all strategy config types
-TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | SCDTrainingConfig
+TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | SCDTrainingConfig | VFMSCDTrainingConfig
 
 __all__ = [
     "DEFAULT_FPS",
@@ -32,6 +34,8 @@ __all__ = [
     "TrainingStrategy",
     "TrainingStrategyConfig",
     "TrainingStrategyConfigBase",
+    "VFMSCDTrainingConfig",
+    "VFMSCDTrainingStrategy",
     "VideoToVideoConfig",
     "VideoToVideoStrategy",
     "get_training_strategy",
@@ -56,6 +60,8 @@ def get_training_strategy(config: TrainingStrategyConfig) -> TrainingStrategy:
             strategy = VideoToVideoStrategy(config)
         case SCDTrainingConfig():
             strategy = SCDTrainingStrategy(config)
+        case VFMSCDTrainingConfig():
+            strategy = VFMSCDTrainingStrategy(config)
         case _:
             raise ValueError(f"Unknown training strategy config type: {type(config).__name__}")
 

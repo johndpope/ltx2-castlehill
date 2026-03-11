@@ -1,0 +1,190 @@
+# =============================================================================
+# LTX-2 VFM-SCD — Variational Flow Maps + Separable Causal Diffusion
+# =============================================================================
+#
+# Implements "Variational Flow Maps: Make Some Noise for One-Step Conditional
+# Generation" (Mammadov et al., 2026, arXiv:2603.07276) on top of the SCD
+# encoder-decoder architecture.
+#
+# Key idea: Instead of iterative denoising guidance, learn a noise adapter
+# qφ(z|y) that outputs observation-dependent noise. Mapping z through the
+# flow map (SCD decoder) produces conditional samples in 1-4 steps.
+#
+# Architecture:
+#   SCD Encoder (32 layers) → shift features → Noise Adapter (4-layer MLP)
+#   → structured noise z ~ qφ → SCD Decoder (16 layers) → velocity → x̂₀
+#
+# Loss (VFM Paper Eq. 19):
+#   L = (1/2τ²) * L_MF + (1/2σ²) * L_obs + L_KL
+#
+# Prerequisites:
+#   - Pre-trained SCD checkpoint (from ltx2_scd_token_concat.yaml training)
+#   - Same dataset as SCD training
+#
+# Usage:
+#   cd ltx-trainer
+#   python3 scripts/train.py configs/ltx2_vfm_scd.yaml
+#
+# =============================================================================
+
+# Model — start from best SCD checkpoint
+model:
+  model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+  # Load pretrained SCD LoRA as starting point for flow map fθ
+  # load_checkpoint: "/media/2TB/omnitransfer/output/scd_token_concat/checkpoints/lora_weights_step_02000.safetensors"
+
+# LoRA — same config as SCD (flow map parameters)
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+# Training strategy: VFM + SCD joint training
+training_strategy:
+  name: "vfm_scd"
+
+  # === SCD Architecture (same as base SCD) ===
+  encoder_layers: 32
+  decoder_input_combine: "token_concat"
+  per_frame_decoder: true
+  first_frame_conditioning_p: 0.1
+
+  # === VFM Noise Adapter ===
+  adapter_variant: "mlp"         # "mlp" (per-token, fast) or "transformer" (sequence-aware)
+  adapter_hidden_dim: 1024       # MLP hidden dimension
+  adapter_num_layers: 4          # Adapter depth
+  adapter_learning_rate: 1.0e-4  # Adapter lr (typically higher than flow map lr)
+
+  # === VFM Loss Hyperparameters ===
+  # VFM Paper §3.3: τ > σ yields stable optimization
+  tau: 1.0                       # Data misfit tolerance (weight for L_MF)
+  obs_noise_level: 0.1           # Default observation noise σ
+  alpha: 0.5                     # P(adapter noise) vs P(standard N(0,I))
+  kl_weight: 1.0                 # KL divergence weight
+  obs_loss_weight: 1.0           # Additional observation loss weight
+
+  # === VFM Adaptive Loss (Paper §3.4) ===
+  adaptive_loss: true
+  adaptive_gamma: 1.0
+  adaptive_p: 0.5
+
+  # === EMA for observation loss stability ===
+  ema_decay: 0.999
+
+  # === Inverse Problem Distribution ===
+  # Weights control how often each task is sampled during training.
+  # VFM Paper §3.2: Amortizing over multiple inverse problems.
+  inverse_problem_weights:
+    i2v: 0.4       # Image-to-video (primary use case)
+    inpaint: 0.2   # Video inpainting
+    sr: 0.15       # Super-resolution
+    denoise: 0.1   # Denoising
+    t2v: 0.15      # Text-only (preserves unconditional quality)
+
+  # === Audio ===
+  with_audio: false
+
+  # === Scheduled Sampling (from SCD) ===
+  scheduled_sampling: false  # Start without SS; enable after adapter converges
+  ss_p_ar_start: 0.0
+  ss_p_ar_end: 0.3
+  ss_warmup_steps: 100
+  ss_ramp_steps: 200
+  ss_noise_augment: 0.05
+
+  # === Logging ===
+  log_reconstructions: true
+  reconstruction_log_interval: 100
+  log_vfm_metrics: true
+
+# Optimization
+# VFM Paper §3.4: Use separate learning rates for θ (flow map) and φ (adapter).
+# The main optimizer handles both, but adapter params may need higher lr.
+# For now, use a single optimizer; adapter-specific lr can be added later.
+optimization:
+  learning_rate: 5.0e-4          # Flow map lr (conservative)
+  steps: 3000                    # More steps for joint training
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"        # AdamW for stability during joint training
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 200              # Longer warmup for joint training stability
+  enable_gradient_checkpointing: true
+
+# Acceleration
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+# Hardware (dual GPU)
+hardware:
+  devices:
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+# Data
+data:
+  preprocessed_data_root: "/media/2TB/omnitransfer/data/ditto_subset"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+# Validation — disabled during initial training
+validation:
+  prompts: []
+  negative_prompt: "blurry, distorted, low quality"
+  video_dims: [768, 448, 25]
+  frame_rate: 20.0
+  seed: 42
+  inference_steps: 4   # VFM enables 1-4 step inference!
+  interval: null
+  videos_per_prompt: 1
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_v"
+  generate_audio: false
+  skip_initial_validation: true
+
+# Checkpoints
+checkpoints:
+  interval: 200
+  keep_last_n: 6
+
+# Flow Matching
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+# Hub
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+# Weights & Biases
+wandb:
+  enabled: true
+  project: "vfm-scd"
+  entity: null
+  tags: ["vfm", "scd", "noise-adapter", "one-step", "conditional", "joint-training"]
+  log_validation_videos: false
+
+# General
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/vfm_scd"
