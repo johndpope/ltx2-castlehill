@@ -298,6 +298,11 @@ class LtxvTrainer:
                             p_ar = self._training_strategy._get_p_ar()
                             if p_ar > 0.0 or hasattr(self._training_strategy, "_current_step"):
                                 metrics["train/p_ar"] = p_ar
+                        # Log VFM-specific metrics if available
+                        if hasattr(self._training_strategy, "_last_vfm_metrics"):
+                            vfm_metrics = getattr(self._training_strategy, "_last_vfm_metrics", None)
+                            if vfm_metrics:
+                                metrics.update(vfm_metrics)
                         self._log_metrics(metrics)
 
                         # Save debug image every optimization step (overwrites)

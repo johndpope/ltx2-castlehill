@@ -662,24 +662,22 @@ class VFMSCDTrainingStrategy(TrainingStrategy):
                 weight = 1.0 / (total_loss.detach() + cfg.adaptive_gamma).pow(cfg.adaptive_p)
             total_loss = weight * total_loss
 
-        # Log VFM metrics
-        if cfg.log_vfm_metrics and WANDB_AVAILABLE and wandb.run is not None:
-            if self._current_step % 10 == 0:
-                log_dict = {
-                    "vfm/loss_mf": loss_mf.item(),
-                    "vfm/loss_obs": loss_obs.item(),
-                    "vfm/loss_kl": loss_kl.item(),
-                    "vfm/loss_total": total_loss.item(),
-                    "vfm/task": getattr(inputs, "_vfm_task_name", "unknown"),
-                    "vfm/use_adapter": float(use_adapter),
-                }
-                if adapter_mu is not None:
-                    log_dict["vfm/adapter_mu_mean"] = adapter_mu.mean().item()
-                    log_dict["vfm/adapter_mu_std"] = adapter_mu.std().item()
-                    log_dict["vfm/adapter_sigma_mean"] = torch.exp(
-                        inputs._vfm_adapter_log_sigma
-                    ).mean().item()
-                wandb.log(log_dict, step=self._current_step)
+        # Store VFM metrics for the trainer's logging loop to pick up
+        # (avoids wandb step conflicts from logging during compute_loss)
+        self._last_vfm_metrics = {
+            "vfm/loss_mf": loss_mf.item(),
+            "vfm/loss_obs": loss_obs.item() if isinstance(loss_obs, Tensor) else loss_obs,
+            "vfm/loss_kl": loss_kl.item() if isinstance(loss_kl, Tensor) else loss_kl,
+            "vfm/loss_total": total_loss.item(),
+            "vfm/task": getattr(inputs, "_vfm_task_name", "unknown"),
+            "vfm/use_adapter": float(use_adapter),
+        }
+        if adapter_mu is not None:
+            self._last_vfm_metrics["vfm/adapter_mu_mean"] = adapter_mu.mean().item()
+            self._last_vfm_metrics["vfm/adapter_mu_std"] = adapter_mu.std().item()
+            self._last_vfm_metrics["vfm/adapter_sigma_mean"] = torch.exp(
+                inputs._vfm_adapter_log_sigma
+            ).mean().item()
 
         return total_loss
 
