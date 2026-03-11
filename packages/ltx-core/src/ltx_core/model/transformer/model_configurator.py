@@ -60,6 +60,10 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
             rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
             apply_gated_attention=config.get("apply_gated_attention", False),
+            ffn_type=config.get("ffn_type", "ffn"),
+            gffn_kwargs=config.get("gffn_kwargs", None),
+            self_attn_type=config.get("self_attn_type", "standard"),
+            clifford_kwargs=config.get("clifford_kwargs", None),
         )
 
 
@@ -107,6 +111,10 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
             apply_gated_attention=config.get("apply_gated_attention", False),
+            ffn_type=config.get("ffn_type", "ffn"),
+            gffn_kwargs=config.get("gffn_kwargs", None),
+            self_attn_type=config.get("self_attn_type", "standard"),
+            clifford_kwargs=config.get("clifford_kwargs", None),
         )
 
 
