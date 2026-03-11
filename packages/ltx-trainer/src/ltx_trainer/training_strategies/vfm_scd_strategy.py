@@ -603,18 +603,30 @@ class VFMSCDTrainingStrategy(TrainingStrategy):
         if use_adapter and adapter_mu is not None:
             observation = inputs._vfm_observation
             noise_level = inputs._vfm_noise_level
+            task_name = getattr(inputs, "_vfm_task_name", "t2v")
 
             if observation is not None and noise_level > 0:
                 # One-step decode: x̂ = z - v̂ (flow matching recovery)
-                # Use the video_pred (velocity) from the decoder
                 video_noise = inputs._vfm_video_noise
-                x_hat = video_noise - video_pred.detach()  # Detach for stability
+                x_hat = video_noise - video_pred.detach()  # Detach for stability (use EMA ideally)
 
-                # Apply forward operator to get predicted observation
-                # For simplicity, use the same operator that created the observation
-                # In practice, observation was y = A(x) + ε, so we check consistency
-                obs_error = (observation - x_hat).pow(2)
-                loss_obs = obs_error.mean()
+                # Apply the same forward operator to x_hat so shapes match observation
+                # VFM Paper Eq. 14: L_obs = E[||y - A(fθ(z))||²]
+                # observation = A(x_gt) + ε, so we need A(x_hat) to compare
+                if self._inverse_problem_sampler is not None and task_name in self._inverse_problem_sampler.operators:
+                    operator = self._inverse_problem_sampler.operators[task_name]
+                    x_hat_obs = operator(x_hat)
+                else:
+                    x_hat_obs = x_hat
+
+                # Ensure shapes match (observation may have been produced with noise added)
+                if observation.shape == x_hat_obs.shape:
+                    obs_error = (observation - x_hat_obs).pow(2)
+                    loss_obs = obs_error.mean()
+                else:
+                    # Shape mismatch — use reconstruction loss as fallback
+                    clean_latents = inputs._vfm_video_latents
+                    loss_obs = (x_hat - clean_latents).pow(2).mean()
 
             # Scale by 1/(2σ²) — VFM Paper Eq. 19
             sigma_sq = max(noise_level, cfg.obs_noise_level) ** 2
