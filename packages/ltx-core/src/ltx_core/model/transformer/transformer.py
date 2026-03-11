@@ -263,7 +263,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
             if not perturbations.all_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx):
                 norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
                 v_mask = perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx)
-                vx = vx + self.attn1(norm_vx, pe=video.positional_embeddings) * vgate_msa * v_mask
+                # Pass self_attn_mask (frame-level causal mask for SCD encoder) if available
+                sa_mask = getattr(video, 'self_attn_mask', None)
+                vx = vx + self.attn1(norm_vx, pe=video.positional_embeddings, mask=sa_mask) * vgate_msa * v_mask
 
             vx = vx + self.attn2(rms_norm(vx, eps=self.norm_eps), context=video.context, mask=video.context_mask)
 
