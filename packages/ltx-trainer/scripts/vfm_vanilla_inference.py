@@ -64,7 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-hidden-dim", type=int, default=1024)
     parser.add_argument("--adapter-num-layers", type=int, default=4)
     parser.add_argument("--adapter-variant", type=str, default="mlp",
-                        choices=["mlp", "transformer"])
+                        choices=["mlp", "transformer", "v1b"])
+
+    # v1b-specific adapter config
+    parser.add_argument("--adapter-num-heads", type=int, default=8)
+    parser.add_argument("--adapter-pos-dim", type=int, default=256)
 
     return parser.parse_args()
 
@@ -192,16 +196,30 @@ def main():
     # ══════════════════════════════════════════════════════════════════
     # Step 3: Load noise adapter
     # ══════════════════════════════════════════════════════════════════
-    print(f"\n[3/5] Loading noise adapter...")
-    from ltx_core.model.transformer.noise_adapter import TASK_CLASSES, create_noise_adapter
+    print(f"\n[3/5] Loading noise adapter ({args.adapter_variant})...")
 
-    noise_adapter = create_noise_adapter(
-        input_dim=text_embed_dim,
-        latent_dim=latent_channels,
-        variant=args.adapter_variant,
-        hidden_dim=args.adapter_hidden_dim,
-        num_layers=args.adapter_num_layers,
-    )
+    if args.adapter_variant == "v1b":
+        from ltx_core.model.transformer.noise_adapter_v1b import (
+            TASK_CLASSES,
+            create_noise_adapter_v1b,
+        )
+        noise_adapter = create_noise_adapter_v1b(
+            text_dim=text_embed_dim,
+            latent_dim=latent_channels,
+            hidden_dim=args.adapter_hidden_dim,
+            num_heads=args.adapter_num_heads,
+            num_layers=args.adapter_num_layers,
+            pos_dim=args.adapter_pos_dim,
+        )
+    else:
+        from ltx_core.model.transformer.noise_adapter import TASK_CLASSES, create_noise_adapter
+        noise_adapter = create_noise_adapter(
+            input_dim=text_embed_dim,
+            latent_dim=latent_channels,
+            variant=args.adapter_variant,
+            hidden_dim=args.adapter_hidden_dim,
+            num_layers=args.adapter_num_layers,
+        )
 
     adapter_state = load_file(args.adapter_path)
     noise_adapter.load_state_dict(adapter_state)
@@ -209,7 +227,7 @@ def main():
     noise_adapter.eval()
 
     adapter_params = sum(p.numel() for p in noise_adapter.parameters())
-    print(f"  Adapter: {adapter_params / 1e6:.1f}M params, input_dim={text_embed_dim}")
+    print(f"  Adapter: {adapter_params / 1e6:.1f}M params, variant={args.adapter_variant}")
 
     task_idx = TASK_CLASSES.get(args.task, 0)
     task_class = torch.tensor([task_idx], device=device)
@@ -249,14 +267,21 @@ def main():
     gen_start = time.time()
 
     with torch.inference_mode():
-        # ── Noise adapter: pool text → structured noise ──
-        # Mask-aware mean pooling of text embeddings
-        mask = prompt_mask.unsqueeze(-1).float()  # [1, text_seq, 1]
-        pooled_text = (prompt_embeds * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-        text_obs = pooled_text.unsqueeze(1).expand(-1, total_tokens, -1)  # [1, total_tokens, D]
-
-        # Adapter is float32 (LayerNorm requirement), cast input accordingly
-        mu, log_sigma = noise_adapter.forward(text_obs.float(), task_class)
+        # ── Noise adapter: structured noise ──
+        if args.adapter_variant == "v1b":
+            # v1b: pass full text + positions → per-token μ,σ
+            mu, log_sigma = noise_adapter.forward(
+                text_embeddings=prompt_embeds.float(),
+                text_mask=prompt_mask.bool(),
+                positions=positions.float(),
+                task_class=task_class,
+            )
+        else:
+            # v1a: pool text → tile → same μ,σ for all tokens
+            mask = prompt_mask.unsqueeze(-1).float()
+            pooled_text = (prompt_embeds * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+            text_obs = pooled_text.unsqueeze(1).expand(-1, total_tokens, -1)
+            mu, log_sigma = noise_adapter.forward(text_obs.float(), task_class)
         sigma = torch.exp(log_sigma)
         eps = torch.randn(mu.shape, device=device, dtype=torch.float32, generator=generator)
         z = (mu + sigma * eps * args.temperature).to(dtype)
