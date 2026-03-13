@@ -60,7 +60,7 @@ training_strategy:
   with_audio: false
 
   log_reconstructions: true
-  reconstruction_log_interval: 50
+  reconstruction_log_interval: 500
   log_vfm_metrics: true
 
 optimization:
