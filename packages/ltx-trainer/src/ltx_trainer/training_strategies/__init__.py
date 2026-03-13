@@ -3,6 +3,7 @@ This package implements the Strategy Pattern to handle different training modes:
 - Text-to-video training (standard generation, optionally with audio)
 - Video-to-video training (IC-LoRA mode with reference videos)
 - SCD training (Separable Causal Diffusion for long-form video)
+- VFM-SCD training (Variational Flow Maps + SCD for one-step conditional generation)
 Each strategy encapsulates the specific logic for preparing model inputs and computing loss.
 """
 
@@ -17,13 +18,24 @@ from ltx_trainer.training_strategies.base_strategy import (
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig, TextToVideoStrategy
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig, VideoToVideoStrategy
 from ltx_trainer.training_strategies.scd_strategy import SCDTrainingConfig, SCDTrainingStrategy
+from ltx_trainer.training_strategies.vfm_scd_strategy import VFMSCDTrainingConfig, VFMSCDTrainingStrategy
+from ltx_trainer.training_strategies.vfm_strategy import VFMTrainingConfig, VFMTrainingStrategy
+from ltx_trainer.training_strategies.vfm_strategy_v1b import VFMv1bTrainingConfig, VFMv1bTrainingStrategy
+from ltx_trainer.training_strategies.vfm_strategy_v1c import VFMv1cTrainingConfig, VFMv1cTrainingStrategy
+from ltx_trainer.training_strategies.vfm_strategy_v1d import VFMv1dTrainingConfig, VFMv1dTrainingStrategy
+from ltx_trainer.training_strategies.vfm_strategy_v1e import VFMv1eTrainingConfig, VFMv1eTrainingStrategy
+from ltx_trainer.training_strategies.vfm_distill_strategy import VFMDistillConfig, VFMDistillStrategy
+from ltx_trainer.training_strategies.vfm_scd_distill_strategy import VFMSCDDistillConfig, VFMSCDDistillStrategy
+from ltx_trainer.training_strategies.isogen_strategy import IsoGenTrainingConfig, IsoGenTrainingStrategy
 
 # Type alias for all strategy config types
-TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | SCDTrainingConfig
+TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | SCDTrainingConfig | VFMSCDDistillConfig | VFMSCDTrainingConfig | VFMTrainingConfig | VFMv1bTrainingConfig | VFMv1cTrainingConfig | VFMv1dTrainingConfig | VFMv1eTrainingConfig | VFMDistillConfig | IsoGenTrainingConfig
 
 __all__ = [
     "DEFAULT_FPS",
     "VIDEO_SCALE_FACTORS",
+    "IsoGenTrainingConfig",
+    "IsoGenTrainingStrategy",
     "ModelInputs",
     "SCDTrainingConfig",
     "SCDTrainingStrategy",
@@ -32,6 +44,22 @@ __all__ = [
     "TrainingStrategy",
     "TrainingStrategyConfig",
     "TrainingStrategyConfigBase",
+    "VFMSCDTrainingConfig",
+    "VFMSCDTrainingStrategy",
+    "VFMTrainingConfig",
+    "VFMTrainingStrategy",
+    "VFMDistillConfig",
+    "VFMDistillStrategy",
+    "VFMSCDDistillConfig",
+    "VFMSCDDistillStrategy",
+    "VFMv1bTrainingConfig",
+    "VFMv1bTrainingStrategy",
+    "VFMv1cTrainingConfig",
+    "VFMv1cTrainingStrategy",
+    "VFMv1dTrainingConfig",
+    "VFMv1dTrainingStrategy",
+    "VFMv1eTrainingConfig",
+    "VFMv1eTrainingStrategy",
     "VideoToVideoConfig",
     "VideoToVideoStrategy",
     "get_training_strategy",
@@ -56,6 +84,24 @@ def get_training_strategy(config: TrainingStrategyConfig) -> TrainingStrategy:
             strategy = VideoToVideoStrategy(config)
         case SCDTrainingConfig():
             strategy = SCDTrainingStrategy(config)
+        case VFMSCDDistillConfig():
+            strategy = VFMSCDDistillStrategy(config)
+        case VFMSCDTrainingConfig():
+            strategy = VFMSCDTrainingStrategy(config)
+        case IsoGenTrainingConfig():
+            strategy = IsoGenTrainingStrategy(config)
+        case VFMDistillConfig():
+            strategy = VFMDistillStrategy(config)
+        case VFMv1eTrainingConfig():
+            strategy = VFMv1eTrainingStrategy(config)
+        case VFMv1dTrainingConfig():
+            strategy = VFMv1dTrainingStrategy(config)
+        case VFMv1cTrainingConfig():
+            strategy = VFMv1cTrainingStrategy(config)
+        case VFMv1bTrainingConfig():
+            strategy = VFMv1bTrainingStrategy(config)
+        case VFMTrainingConfig():
+            strategy = VFMTrainingStrategy(config)
         case _:
             raise ValueError(f"Unknown training strategy config type: {type(config).__name__}")
 

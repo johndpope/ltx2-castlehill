@@ -39,3 +39,5 @@ tmp
 *.png
 *.wav
 *.webp
+uv.lock
+/wandb

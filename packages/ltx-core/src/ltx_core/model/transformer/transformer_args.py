@@ -25,6 +25,7 @@ class TransformerArgs:
     cross_scale_shift_timestep: torch.Tensor | None
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
+    self_attn_mask: torch.Tensor | None = None  # Frame-level causal mask for SCD encoder
 
 
 class TransformerArgsPreprocessor:

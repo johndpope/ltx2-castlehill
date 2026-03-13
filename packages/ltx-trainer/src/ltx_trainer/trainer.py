@@ -298,6 +298,11 @@ class LtxvTrainer:
                             p_ar = self._training_strategy._get_p_ar()
                             if p_ar > 0.0 or hasattr(self._training_strategy, "_current_step"):
                                 metrics["train/p_ar"] = p_ar
+                        # Log VFM-specific metrics if available
+                        if hasattr(self._training_strategy, "_last_vfm_metrics"):
+                            vfm_metrics = getattr(self._training_strategy, "_last_vfm_metrics", None)
+                            if vfm_metrics:
+                                metrics.update(vfm_metrics)
                         self._log_metrics(metrics)
 
                         # Save debug image every optimization step (overwrites)
@@ -652,9 +657,11 @@ class LtxvTrainer:
             logger.info(f"Moving {model_size} transformer to {hw_devices.transformer}...")
             self._transformer = self._transformer.to(hw_devices.transformer)
 
-        # Wrap transformer with SCD model if using SCD strategy (includes EditCtrl+SCD)
+        # Wrap transformer with SCD model if using SCD or VFM-SCD strategy
         from ltx_trainer.training_strategies.scd_strategy import SCDTrainingStrategy  # noqa: PLC0415
-        if isinstance(self._training_strategy, SCDTrainingStrategy):
+        from ltx_trainer.training_strategies.vfm_scd_strategy import VFMSCDTrainingStrategy  # noqa: PLC0415
+        from ltx_trainer.training_strategies.vfm_scd_distill_strategy import VFMSCDDistillStrategy  # noqa: PLC0415
+        if isinstance(self._training_strategy, (SCDTrainingStrategy, VFMSCDTrainingStrategy, VFMSCDDistillStrategy)):
             from ltx_core.model.transformer.scd_model import LTXSCDModel  # noqa: PLC0415
             scd_config = self._training_strategy.config
             # Pass EditCtrl local control injection config if available
@@ -672,6 +679,43 @@ class LtxvTrainer:
                 f"SCD wrapper: {scd_config.encoder_layers} encoder layers, "
                 f"{len(self._transformer.decoder_blocks)} decoder layers, "
                 f"combine={scd_config.decoder_input_combine}"
+            )
+
+        # VFM: Create noise adapter and attach to strategy
+        self._noise_adapter = None
+        from ltx_trainer.training_strategies.vfm_strategy import VFMTrainingStrategy  # noqa: PLC0415
+        from ltx_trainer.training_strategies.vfm_strategy_v1b import VFMv1bTrainingStrategy  # noqa: PLC0415
+        if isinstance(self._training_strategy, (VFMSCDTrainingStrategy, VFMSCDDistillStrategy, VFMTrainingStrategy, VFMv1bTrainingStrategy)):
+            # Set text embed dim for vanilla VFM / v1b (they need it before adapter creation)
+            if isinstance(self._training_strategy, (VFMTrainingStrategy, VFMv1bTrainingStrategy)):
+                text_embed_dim = self._transformer.caption_projection.linear_1.in_features
+                self._training_strategy.set_text_embed_dim(text_embed_dim)
+
+            adapter_kwargs = self._training_strategy.get_noise_adapter_params()
+
+            # Use appropriate factory for v1b vs v1a
+            if isinstance(self._training_strategy, VFMv1bTrainingStrategy):
+                from ltx_core.model.transformer.noise_adapter_v1b import create_noise_adapter_v1b  # noqa: PLC0415
+                self._noise_adapter = create_noise_adapter_v1b(**adapter_kwargs)
+            else:
+                from ltx_core.model.transformer.noise_adapter import create_noise_adapter  # noqa: PLC0415
+                self._noise_adapter = create_noise_adapter(**adapter_kwargs)
+
+            # Move adapter to same device as transformer
+            adapter_device = next(self._transformer.parameters()).device
+            self._noise_adapter = self._noise_adapter.to(adapter_device)
+            self._training_strategy.set_noise_adapter(self._noise_adapter)
+
+            # Vanilla VFM / v1b: store transformer ref for EMA + flow map freezing
+            if isinstance(self._training_strategy, (VFMTrainingStrategy, VFMv1bTrainingStrategy)):
+                self._training_strategy.set_transformer_ref(self._transformer)
+
+            adapter_params = sum(p.numel() for p in self._noise_adapter.parameters())
+            logger.info(
+                f"VFM noise adapter: "
+                f"{adapter_params:,} params, "
+                f"hidden_dim={adapter_kwargs.get('hidden_dim', '?')}, "
+                f"layers={adapter_kwargs.get('num_layers', '?')}"
             )
 
         # Placeholder for optional modules (EditCtrl, TMA — not included in CastleHill)
@@ -735,6 +779,14 @@ class LtxvTrainer:
                 f"({sum(p.numel() for p in strategy_params):,} total)"
             )
 
+        # VFM: Add noise adapter parameters to trainable params
+        if self._noise_adapter is not None:
+            adapter_params = list(self._noise_adapter.parameters())
+            self._trainable_params.extend(adapter_params)
+            logger.info(
+                f"Added VFM noise adapter: {sum(p.numel() for p in adapter_params):,} params"
+            )
+
         total_params = sum(p.numel() for p in self._trainable_params)
         logger.info(f"Total trainable params: {total_params:,} (stage {training_stage or 'N/A'})")
 
@@ -775,20 +827,26 @@ class LtxvTrainer:
 
     def _load_checkpoint(self) -> None:
         """Load checkpoint if specified in config."""
-        if not self._config.model.load_checkpoint:
-            return
+        if self._config.model.load_checkpoint:
+            checkpoint_path = self._find_checkpoint(self._config.model.load_checkpoint)
+            if not checkpoint_path:
+                logger.warning(f"⚠️ Could not find checkpoint at {self._config.model.load_checkpoint}")
+            else:
+                logger.info(f"📥 Loading checkpoint from {checkpoint_path}")
+                if self._config.model.training_mode == "full":
+                    self._load_full_checkpoint(checkpoint_path)
+                else:
+                    self._load_lora_checkpoint(checkpoint_path)
 
-        checkpoint_path = self._find_checkpoint(self._config.model.load_checkpoint)
-        if not checkpoint_path:
-            logger.warning(f"⚠️ Could not find checkpoint at {self._config.model.load_checkpoint}")
-            return
-
-        logger.info(f"📥 Loading checkpoint from {checkpoint_path}")
-
-        if self._config.model.training_mode == "full":
-            self._load_full_checkpoint(checkpoint_path)
-        else:  # LoRA mode
-            self._load_lora_checkpoint(checkpoint_path)
+        # Load noise adapter checkpoint (VFM strategies)
+        if self._config.model.load_noise_adapter and self._noise_adapter is not None:
+            adapter_path = Path(self._config.model.load_noise_adapter)
+            if adapter_path.exists():
+                adapter_sd = load_file(str(adapter_path))
+                self._noise_adapter.load_state_dict(adapter_sd)
+                logger.info(f"📥 Loaded noise adapter from {adapter_path.name}")
+            else:
+                logger.warning(f"⚠️ Noise adapter not found: {adapter_path}")
 
     def _load_full_checkpoint(self, checkpoint_path: Path) -> None:
         """Load full model checkpoint."""
@@ -1315,6 +1373,13 @@ class LtxvTrainer:
 
             # Save to disk
             save_file(state_dict, saved_weights_path)
+
+            # Save noise adapter separately if present (VFM strategy)
+            if self._noise_adapter is not None:
+                adapter_path = save_dir / f"noise_adapter_step_{self._global_step:05d}.safetensors"
+                adapter_sd = {k: v.to(save_dtype) for k, v in self._noise_adapter.state_dict().items()}
+                save_file(adapter_sd, adapter_path)
+                logger.info(f"💾 Noise adapter for step {self._global_step} saved in {adapter_path.relative_to(self._config.output_dir)}")
         else:
             # Cast to configured precision
             full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}

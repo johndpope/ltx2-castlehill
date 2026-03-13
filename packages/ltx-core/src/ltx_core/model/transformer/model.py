@@ -8,7 +8,7 @@ from ltx_core.model.transformer.attention import AttentionCallable, AttentionFun
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.text_projection import PixArtAlphaTextProjection
-from ltx_core.model.transformer.transformer import BasicAVTransformerBlock, TransformerConfig
+from ltx_core.model.transformer.transformer import BasicAVTransformerBlock, FFNType, SelfAttentionType, TransformerConfig
 from ltx_core.model.transformer.transformer_args import (
     MultiModalTransformerArgsPreprocessor,
     TransformerArgs,
@@ -62,6 +62,10 @@ class LTXModel(torch.nn.Module):
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         double_precision_rope: bool = False,
         apply_gated_attention: bool = False,
+        ffn_type: FFNType = "ffn",
+        gffn_kwargs: dict | None = None,
+        self_attn_type: SelfAttentionType = "standard",
+        clifford_kwargs: dict | None = None,
     ):
         super().__init__()
         self._enable_gradient_checkpointing = False
@@ -115,6 +119,10 @@ class LTXModel(torch.nn.Module):
             norm_eps=norm_eps,
             attention_type=attention_type,
             apply_gated_attention=apply_gated_attention,
+            ffn_type=ffn_type,
+            gffn_kwargs=gffn_kwargs,
+            self_attn_type=self_attn_type,
+            clifford_kwargs=clifford_kwargs,
         )
 
     def _init_video(
@@ -275,6 +283,10 @@ class LTXModel(torch.nn.Module):
         norm_eps: float,
         attention_type: AttentionFunction | AttentionCallable,
         apply_gated_attention: bool,
+        ffn_type: FFNType = "ffn",
+        gffn_kwargs: dict | None = None,
+        self_attn_type: SelfAttentionType = "standard",
+        clifford_kwargs: dict | None = None,
     ) -> None:
         """Initialize transformer blocks for LTX."""
         video_config = (
@@ -308,6 +320,10 @@ class LTXModel(torch.nn.Module):
                     rope_type=self.rope_type,
                     norm_eps=norm_eps,
                     attention_function=attention_type,
+                    ffn_type=ffn_type,
+                    gffn_kwargs=gffn_kwargs,
+                    self_attn_type=self_attn_type,
+                    clifford_kwargs=clifford_kwargs,
                 )
                 for idx in range(num_layers)
             ]

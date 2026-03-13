@@ -1,0 +1,157 @@
+# VFM v1e — Content-Adaptive Router + Detail Preservation (sanity check)
+# Uses content router to predict per-token complexity, guides sigma scheduling
+# and loss weighting. Frequency loss preserves spatial detail.
+#
+# Key v1e features:
+#   - ContentRouter: learns per-token complexity from GT latents
+#   - Router-guided sigma: complex tokens → lower σ (easier denoising)
+#   - Complexity-weighted loss: more gradient on detailed regions
+#   - Frequency loss: penalizes loss of spatial edges/textures
+
+model:
+  model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+training_strategy:
+  name: "vfm_v1e"
+
+  # === Content Router (v1e) ===
+  content_router: true
+  router_hidden_dim: 256
+  router_num_layers: 2
+  router_num_heads: 4
+  router_detach_input: true
+  router_supervision: true
+  router_supervision_weight: 0.1
+
+  # === Complexity-weighted loss (v1e) ===
+  complexity_loss_weight: 0.5
+
+  # === Frequency detail loss (v1e) ===
+  frequency_loss_weight: 0.05
+  frequency_loss_warmup: 50
+
+  # === Per-token Sigma (v1d, driven by router in v1e) ===
+  per_token_sigma: true
+  sigma_head_hidden_dim: 256
+  sigma_min: 0.05
+  sigma_max: 0.95
+  sigma_entropy_weight: 0.01
+
+  # === No distillation for sanity check ===
+  distill_mode: "none"
+
+  # === v1b Adapter ===
+  adapter_variant: "transformer"
+  adapter_hidden_dim: 512
+  adapter_num_heads: 8
+  adapter_num_layers: 4
+  adapter_pos_dim: 256
+
+  # === VFM Loss ===
+  tau: 1.0
+  obs_noise_level: 0.2
+  alpha: 0.5
+  kl_weight: 3.0
+  kl_free_bits: 0.25
+  obs_loss_weight: 0.0
+  adaptive_loss: false
+  ema_decay: 0.999
+  first_frame_conditioning_p: 0.0
+
+  # === v1c Diversity ===
+  diversity_weight: 0.1
+  temporal_diversity_weight: 0.2
+  spatial_diversity_weight: 0.05
+  diversity_warmup_steps: 50
+
+  inverse_problem_weights:
+    i2v: 1.0
+
+  with_audio: false
+
+  log_reconstructions: true
+  reconstruction_log_interval: 500
+  log_vfm_metrics: true
+
+optimization:
+  learning_rate: 3.0e-4
+  steps: 500
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 50
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+hardware:
+  devices:
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+data:
+  preprocessed_data_root: "/media/12TB/ddit_ditto_data"
+  num_dataloader_workers: 0
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+validation:
+  prompts: []
+  video_dims: [768, 448, 25]
+  frame_rate: 20.0
+  seed: 42
+  inference_steps: 1
+  interval: null
+  videos_per_prompt: 1
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_v"
+  generate_audio: false
+  skip_initial_validation: true
+
+checkpoints:
+  interval: 100
+  keep_last_n: 3
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "vfm-v1e"
+  entity: null
+  tags: ["vfm-v1e", "content-router", "detail-preservation", "overfit"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/vfm_v1e_overfit"

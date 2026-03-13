@@ -1,4 +1,5 @@
 from dataclasses import dataclass, replace
+from typing import Literal
 
 import torch
 
@@ -8,6 +9,88 @@ from ltx_core.model.transformer.feed_forward import FeedForward
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.transformer_args import TransformerArgs
 from ltx_core.utils import rms_norm
+
+# Type alias for FFN selection
+FFNType = Literal["ffn", "gffn_global", "gffn_hybrid", "gffn_hrr"]
+
+# Type alias for self-attention selection
+SelfAttentionType = Literal["standard", "clifford_rolling"]
+
+_GFFN_TYPE_TO_VARIANT = {
+    "gffn_global": "global",
+    "gffn_hybrid": "hybrid",
+    "gffn_hrr": "hrr",
+}
+
+
+def _create_ffn(dim: int, dim_out: int, ffn_type: FFNType = "ffn", **gffn_kwargs) -> torch.nn.Module:
+    """Factory to create the appropriate FFN module.
+
+    Args:
+        dim: Input dimension
+        dim_out: Output dimension
+        ffn_type: "ffn" (standard), "gffn_global", "gffn_hybrid", or "gffn_hrr"
+        **gffn_kwargs: Extra args for gFFN (num_shifts, mode, proj_factor, etc.)
+    """
+    if ffn_type == "ffn":
+        return FeedForward(dim, dim_out=dim_out)
+    elif ffn_type in _GFFN_TYPE_TO_VARIANT:
+        from ltx_core.model.transformer.gffn import create_gffn
+        variant = _GFFN_TYPE_TO_VARIANT[ffn_type]
+        return create_gffn(dim, dim_out=dim_out, variant=variant, **gffn_kwargs)
+    else:
+        raise ValueError(f"Unknown ffn_type: {ffn_type}")
+
+
+def _create_self_attention(
+    query_dim: int,
+    heads: int,
+    dim_head: int,
+    context_dim: int | None,
+    rope_type: LTXRopeType,
+    norm_eps: float,
+    attention_function: AttentionCallable | AttentionFunction,
+    apply_gated_attention: bool,
+    self_attn_type: SelfAttentionType = "standard",
+    clifford_kwargs: dict | None = None,
+) -> torch.nn.Module:
+    """Factory to create the appropriate self-attention module.
+
+    Args:
+        self_attn_type: "standard" (default Attention) or "clifford_rolling"
+        clifford_kwargs: Extra args for CliffordRollingAttention
+            (num_seq_shifts, num_channel_shifts, max_seq_len)
+    """
+    if self_attn_type == "standard":
+        return Attention(
+            query_dim=query_dim,
+            heads=heads,
+            dim_head=dim_head,
+            context_dim=context_dim,
+            rope_type=rope_type,
+            norm_eps=norm_eps,
+            attention_function=attention_function,
+            apply_gated_attention=apply_gated_attention,
+        )
+    elif self_attn_type == "clifford_rolling":
+        from ltx_core.model.transformer.clifford_attention import CliffordRollingAttention
+
+        ck = clifford_kwargs or {}
+        return CliffordRollingAttention(
+            query_dim=query_dim,
+            heads=heads,
+            dim_head=dim_head,
+            context_dim=context_dim,
+            rope_type=rope_type,
+            norm_eps=norm_eps,
+            attention_function=attention_function,
+            apply_gated_attention=apply_gated_attention,
+            num_seq_shifts=ck.get("num_seq_shifts", 16),
+            num_channel_shifts=ck.get("num_channel_shifts", 4),
+            max_seq_len=ck.get("max_seq_len", 2048),
+        )
+    else:
+        raise ValueError(f"Unknown self_attn_type: {self_attn_type}")
 
 
 @dataclass
@@ -28,12 +111,17 @@ class BasicAVTransformerBlock(torch.nn.Module):
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         norm_eps: float = 1e-6,
         attention_function: AttentionFunction | AttentionCallable = AttentionFunction.DEFAULT,
+        ffn_type: FFNType = "ffn",
+        gffn_kwargs: dict | None = None,
+        self_attn_type: SelfAttentionType = "standard",
+        clifford_kwargs: dict | None = None,
     ):
         super().__init__()
+        gffn_kwargs = gffn_kwargs or {}
 
         self.idx = idx
         if video is not None:
-            self.attn1 = Attention(
+            self.attn1 = _create_self_attention(
                 query_dim=video.dim,
                 heads=video.heads,
                 dim_head=video.d_head,
@@ -42,6 +130,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 norm_eps=norm_eps,
                 attention_function=attention_function,
                 apply_gated_attention=video.apply_gated_attention,
+                self_attn_type=self_attn_type,
+                clifford_kwargs=clifford_kwargs,
             )
             self.attn2 = Attention(
                 query_dim=video.dim,
@@ -53,11 +143,11 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 attention_function=attention_function,
                 apply_gated_attention=video.apply_gated_attention,
             )
-            self.ff = FeedForward(video.dim, dim_out=video.dim)
+            self.ff = _create_ffn(video.dim, dim_out=video.dim, ffn_type=ffn_type, **gffn_kwargs)
             self.scale_shift_table = torch.nn.Parameter(torch.empty(6, video.dim))
 
         if audio is not None:
-            self.audio_attn1 = Attention(
+            self.audio_attn1 = _create_self_attention(
                 query_dim=audio.dim,
                 heads=audio.heads,
                 dim_head=audio.d_head,
@@ -66,6 +156,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 norm_eps=norm_eps,
                 attention_function=attention_function,
                 apply_gated_attention=audio.apply_gated_attention,
+                self_attn_type=self_attn_type,
+                clifford_kwargs=clifford_kwargs,
             )
             self.audio_attn2 = Attention(
                 query_dim=audio.dim,
@@ -77,7 +169,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 attention_function=attention_function,
                 apply_gated_attention=audio.apply_gated_attention,
             )
-            self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim)
+            self.audio_ff = _create_ffn(audio.dim, dim_out=audio.dim, ffn_type=ffn_type, **gffn_kwargs)
             self.audio_scale_shift_table = torch.nn.Parameter(torch.empty(6, audio.dim))
 
         if audio is not None and video is not None:
@@ -171,7 +263,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
             if not perturbations.all_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx):
                 norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
                 v_mask = perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx)
-                vx = vx + self.attn1(norm_vx, pe=video.positional_embeddings) * vgate_msa * v_mask
+                # Pass self_attn_mask (frame-level causal mask for SCD encoder) if available
+                sa_mask = getattr(video, 'self_attn_mask', None)
+                vx = vx + self.attn1(norm_vx, pe=video.positional_embeddings, mask=sa_mask) * vgate_msa * v_mask
 
             vx = vx + self.attn2(rms_norm(vx, eps=self.norm_eps), context=video.context, mask=video.context_mask)
 
