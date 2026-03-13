@@ -724,6 +724,97 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
 
         return warmup_factor * (loss_token_div + loss_temporal_div + loss_spatial_div)
 
+    def log_reconstructions_to_wandb(
+        self,
+        video_pred: Tensor,
+        inputs: ModelInputs,
+        step: int,
+        vae_decoder: torch.nn.Module | None = None,
+        prefix: str = "train",
+    ) -> dict[str, Any]:
+        """Log reconstruction + trajectory plots to W&B."""
+        # Parent handles video reconstruction
+        log_dict = super().log_reconstructions_to_wandb(
+            video_pred=video_pred, inputs=inputs, step=step,
+            vae_decoder=vae_decoder, prefix=prefix,
+        )
+
+        # Add trajectory plots if distillation data is available
+        teacher_states = getattr(inputs, "_distill_teacher_states", None)
+        if teacher_states is not None:
+            try:
+                from ltx_trainer.training_strategies.vfm_distill_strategy import VFMDistillStrategy
+                traj_plots = VFMDistillStrategy._build_trajectory_plots(
+                    video_pred, inputs, step, prefix,
+                )
+                log_dict.update(traj_plots)
+            except Exception as e:
+                logger.warning(f"Failed to build trajectory plots: {e}")
+
+        # Log per-token sigma heatmap
+        per_token_sigmas = getattr(inputs, "_per_token_sigmas", None)
+        if per_token_sigmas is not None:
+            try:
+                sigma_plots = self._build_sigma_plots(per_token_sigmas, inputs, step, prefix)
+                log_dict.update(sigma_plots)
+            except Exception as e:
+                logger.warning(f"Failed to build sigma plots: {e}")
+
+        return log_dict
+
+    @staticmethod
+    def _build_sigma_plots(
+        per_token_sigmas: Tensor,
+        inputs: ModelInputs,
+        step: int,
+        prefix: str = "train",
+    ) -> dict[str, Any]:
+        """Build per-token sigma visualization for W&B."""
+        try:
+            import wandb
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+
+            sigmas = per_token_sigmas[0].float().cpu()  # [seq]
+            seq_len = sigmas.shape[0]
+
+            raw_latents = getattr(inputs, "_raw_video_latents", None)
+            if raw_latents is None:
+                return {}
+
+            num_frames = raw_latents.shape[2]
+            tpf = seq_len // num_frames
+            h = raw_latents.shape[3]
+            w = raw_latents.shape[4]
+
+            # Reshape to spatial grid per frame
+            sigma_frames = sigmas[:num_frames * tpf].reshape(num_frames, h, w)
+
+            fig = make_subplots(
+                rows=1, cols=num_frames,
+                subplot_titles=[f"Frame {i}" for i in range(num_frames)],
+            )
+            for f_idx in range(num_frames):
+                fig.add_trace(
+                    go.Heatmap(
+                        z=sigma_frames[f_idx].numpy(),
+                        colorscale="RdYlBu_r",
+                        zmin=0.0, zmax=1.0,
+                        showscale=(f_idx == num_frames - 1),
+                        colorbar=dict(title="σ"),
+                    ),
+                    row=1, col=f_idx + 1,
+                )
+
+            fig.update_layout(
+                title=f"Per-Token Sigma Map (step {step})",
+                template="plotly_dark",
+                height=250, width=200 * num_frames,
+            )
+            return {f"{prefix}/sigma_heatmap": wandb.Plotly(fig)}
+        except Exception:
+            return {}
+
     @staticmethod
     def _compute_sigma_entropy_loss(per_token_sigmas: Tensor, inputs: ModelInputs) -> Tensor:
         """Encourage diverse per-token sigma values.
