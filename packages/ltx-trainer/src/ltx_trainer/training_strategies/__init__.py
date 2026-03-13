@@ -22,10 +22,12 @@ from ltx_trainer.training_strategies.vfm_scd_strategy import VFMSCDTrainingConfi
 from ltx_trainer.training_strategies.vfm_strategy import VFMTrainingConfig, VFMTrainingStrategy
 from ltx_trainer.training_strategies.vfm_strategy_v1b import VFMv1bTrainingConfig, VFMv1bTrainingStrategy
 from ltx_trainer.training_strategies.vfm_strategy_v1c import VFMv1cTrainingConfig, VFMv1cTrainingStrategy
+from ltx_trainer.training_strategies.vfm_distill_strategy import VFMDistillConfig, VFMDistillStrategy
+from ltx_trainer.training_strategies.vfm_scd_distill_strategy import VFMSCDDistillConfig, VFMSCDDistillStrategy
 from ltx_trainer.training_strategies.isogen_strategy import IsoGenTrainingConfig, IsoGenTrainingStrategy
 
 # Type alias for all strategy config types
-TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | SCDTrainingConfig | VFMSCDTrainingConfig | VFMTrainingConfig | VFMv1bTrainingConfig | VFMv1cTrainingConfig | IsoGenTrainingConfig
+TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | SCDTrainingConfig | VFMSCDDistillConfig | VFMSCDTrainingConfig | VFMTrainingConfig | VFMv1bTrainingConfig | VFMv1cTrainingConfig | VFMDistillConfig | IsoGenTrainingConfig
 
 __all__ = [
     "DEFAULT_FPS",
@@ -44,6 +46,10 @@ __all__ = [
     "VFMSCDTrainingStrategy",
     "VFMTrainingConfig",
     "VFMTrainingStrategy",
+    "VFMDistillConfig",
+    "VFMDistillStrategy",
+    "VFMSCDDistillConfig",
+    "VFMSCDDistillStrategy",
     "VFMv1bTrainingConfig",
     "VFMv1bTrainingStrategy",
     "VFMv1cTrainingConfig",
@@ -72,10 +78,14 @@ def get_training_strategy(config: TrainingStrategyConfig) -> TrainingStrategy:
             strategy = VideoToVideoStrategy(config)
         case SCDTrainingConfig():
             strategy = SCDTrainingStrategy(config)
+        case VFMSCDDistillConfig():
+            strategy = VFMSCDDistillStrategy(config)
         case VFMSCDTrainingConfig():
             strategy = VFMSCDTrainingStrategy(config)
         case IsoGenTrainingConfig():
             strategy = IsoGenTrainingStrategy(config)
+        case VFMDistillConfig():
+            strategy = VFMDistillStrategy(config)
         case VFMv1cTrainingConfig():
             strategy = VFMv1cTrainingStrategy(config)
         case VFMv1bTrainingConfig():

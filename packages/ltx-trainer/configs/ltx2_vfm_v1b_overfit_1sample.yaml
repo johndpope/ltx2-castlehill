@@ -19,6 +19,8 @@ model:
   model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
   text_encoder_path: "/media/2TB/ltx-models/gemma"
   training_mode: "lora"
+  load_checkpoint: "/media/2TB/omnitransfer/output/vfm_v1b_500sample/checkpoints/lora_weights_step_01500.safetensors"
+  load_noise_adapter: "/media/2TB/omnitransfer/output/vfm_v1b_500sample/checkpoints/noise_adapter_step_01500.safetensors"
 
 lora:
   rank: 32

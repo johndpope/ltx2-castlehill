@@ -1,17 +1,46 @@
-# CastleHill: SCD for LTX-2
+# CastleHill: SCD + VFM for LTX-2
 
 ## Project Overview
 
 **CastleHill** extracts Separable Causal Diffusion (SCD) from `ltx2-omnitransfer` into a clean, standalone repo based on upstream [Lightricks/LTX-2](https://github.com/Lightricks/LTX-2).
 
-**Focus:** Long-form video generation via SCD — autoregressive, chunked denoising that turns LTX-2's 48-layer DiT into an encoder (32 layers, run once per frame) + decoder (16 layers, run N denoising steps per frame). KV-cache on the encoder enables O(1) per-frame context accumulation.
+**Focus:** Long-form video generation via SCD + one-step generation via VFM (Variational Flow Maps). SCD turns LTX-2's 48-layer DiT into an encoder (32 layers) + decoder (16 layers) with KV-cache. VFM trains a noise adapter qφ(z|y) so the flow map produces clean video in 1 step instead of 8.
 
 **Key features:**
 - SCD training strategy (LoRA + per-frame decoder)
 - SCD autoregressive inference (30s+ videos on consumer GPUs)
+- VFM noise adapter (v1a MLP → v1b transformer with cross-attention → v1c diversity-regularized)
+- VFM 1-step inference: 8.7x–21.5x faster than LTX Desktop 8-step
 - DDiT dynamic patch scheduling (optional decoder speedup)
 - BézierFlow / BSplineFlow learned sigma schedulers
 - Muon optimizer support
+
+## Proactive Optimization Guidance
+
+When working on this project, **eagerly anticipate** the user's goals and suggest concrete next steps. Always consider:
+
+### Architecture Iterations to Explore
+- **Trajectory distillation**: Pre-compute teacher 8-step ODE paths, train VFM against teacher trajectory instead of random interpolation. Progressive distillation (8→4→2→1 steps) gives easier learning signal.
+- **Consistency distillation (rCM)**: NVIDIA's approach scales to 10B+ video models, directly applicable to LTX-2's 19B transformer. 2-4 step generation with high quality.
+- **Per-token timestep scheduling (v1d)**: Adapter controls effective σ per token, not just noise z. Inspired by Self-Flow (BFL, arxiv:2603.06507). Deeper change to flow matching pipeline.
+- **Adversarial post-training**: Add discriminator loss after initial VFM training for sharper outputs (DAPT approach).
+- **Resolution/batch tradeoffs**: Smaller latents (e.g., 512x320) enable higher batch sizes. Test whether more diverse batches beat higher-res single samples.
+- **EMA teacher**: Use EMA of the flow map as a slowly-improving teacher for self-distillation.
+
+### Training Strategy Checklist
+Before scaling any experiment:
+1. Does it overfit 1 sample? (sanity check)
+2. Does adapter μ vary across tokens/samples? (if identical → not learning)
+3. Is σ staying above 0.3? (if collapsing → mode collapse)
+4. Are diversity metrics (temporal_std, spatial_std) increasing? (v1c+)
+5. Does 1-step output look better than random noise? (visual check)
+
+### When User Asks About...
+- **Training speed** → suggest smaller resolution, higher batch, gradient accumulation tradeoffs
+- **Quality** → suggest trajectory distillation, adversarial fine-tuning, more training data
+- **New papers** → evaluate relevance to VFM/SCD, flag if per-token timesteps, noise structure, or distillation
+- **Scaling data** → check preprocessing pipeline, estimate encode time, suggest parallel GPU usage
+- **Inference speed** → benchmark against Desktop times, suggest quantization (fp8-quanto on Blackwell)
 
 ## Package Structure
 

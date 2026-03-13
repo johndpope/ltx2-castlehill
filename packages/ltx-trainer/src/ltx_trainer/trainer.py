@@ -660,7 +660,8 @@ class LtxvTrainer:
         # Wrap transformer with SCD model if using SCD or VFM-SCD strategy
         from ltx_trainer.training_strategies.scd_strategy import SCDTrainingStrategy  # noqa: PLC0415
         from ltx_trainer.training_strategies.vfm_scd_strategy import VFMSCDTrainingStrategy  # noqa: PLC0415
-        if isinstance(self._training_strategy, (SCDTrainingStrategy, VFMSCDTrainingStrategy)):
+        from ltx_trainer.training_strategies.vfm_scd_distill_strategy import VFMSCDDistillStrategy  # noqa: PLC0415
+        if isinstance(self._training_strategy, (SCDTrainingStrategy, VFMSCDTrainingStrategy, VFMSCDDistillStrategy)):
             from ltx_core.model.transformer.scd_model import LTXSCDModel  # noqa: PLC0415
             scd_config = self._training_strategy.config
             # Pass EditCtrl local control injection config if available
@@ -684,7 +685,7 @@ class LtxvTrainer:
         self._noise_adapter = None
         from ltx_trainer.training_strategies.vfm_strategy import VFMTrainingStrategy  # noqa: PLC0415
         from ltx_trainer.training_strategies.vfm_strategy_v1b import VFMv1bTrainingStrategy  # noqa: PLC0415
-        if isinstance(self._training_strategy, (VFMSCDTrainingStrategy, VFMTrainingStrategy, VFMv1bTrainingStrategy)):
+        if isinstance(self._training_strategy, (VFMSCDTrainingStrategy, VFMSCDDistillStrategy, VFMTrainingStrategy, VFMv1bTrainingStrategy)):
             # Set text embed dim for vanilla VFM / v1b (they need it before adapter creation)
             if isinstance(self._training_strategy, (VFMTrainingStrategy, VFMv1bTrainingStrategy)):
                 text_embed_dim = self._transformer.caption_projection.linear_1.in_features
@@ -826,20 +827,26 @@ class LtxvTrainer:
 
     def _load_checkpoint(self) -> None:
         """Load checkpoint if specified in config."""
-        if not self._config.model.load_checkpoint:
-            return
+        if self._config.model.load_checkpoint:
+            checkpoint_path = self._find_checkpoint(self._config.model.load_checkpoint)
+            if not checkpoint_path:
+                logger.warning(f"⚠️ Could not find checkpoint at {self._config.model.load_checkpoint}")
+            else:
+                logger.info(f"📥 Loading checkpoint from {checkpoint_path}")
+                if self._config.model.training_mode == "full":
+                    self._load_full_checkpoint(checkpoint_path)
+                else:
+                    self._load_lora_checkpoint(checkpoint_path)
 
-        checkpoint_path = self._find_checkpoint(self._config.model.load_checkpoint)
-        if not checkpoint_path:
-            logger.warning(f"⚠️ Could not find checkpoint at {self._config.model.load_checkpoint}")
-            return
-
-        logger.info(f"📥 Loading checkpoint from {checkpoint_path}")
-
-        if self._config.model.training_mode == "full":
-            self._load_full_checkpoint(checkpoint_path)
-        else:  # LoRA mode
-            self._load_lora_checkpoint(checkpoint_path)
+        # Load noise adapter checkpoint (VFM strategies)
+        if self._config.model.load_noise_adapter and self._noise_adapter is not None:
+            adapter_path = Path(self._config.model.load_noise_adapter)
+            if adapter_path.exists():
+                adapter_sd = load_file(str(adapter_path))
+                self._noise_adapter.load_state_dict(adapter_sd)
+                logger.info(f"📥 Loaded noise adapter from {adapter_path.name}")
+            else:
+                logger.warning(f"⚠️ Noise adapter not found: {adapter_path}")
 
     def _load_full_checkpoint(self, checkpoint_path: Path) -> None:
         """Load full model checkpoint."""

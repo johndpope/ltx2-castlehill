@@ -9,10 +9,12 @@ from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig
 from ltx_trainer.training_strategies.scd_strategy import SCDTrainingConfig
 from ltx_trainer.training_strategies.vfm_scd_strategy import VFMSCDTrainingConfig
+from ltx_trainer.training_strategies.vfm_scd_distill_strategy import VFMSCDDistillConfig
 from ltx_trainer.training_strategies.vfm_strategy import VFMTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1b import VFMv1bTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1c import VFMv1cTrainingConfig
 from ltx_trainer.training_strategies.isogen_strategy import IsoGenTrainingConfig
+from ltx_trainer.training_strategies.vfm_distill_strategy import VFMDistillConfig
 
 
 class ConfigBaseModel(BaseModel):
@@ -41,6 +43,11 @@ class ModelConfig(ConfigBaseModel):
         default=None,
         description="Path to a checkpoint file or directory to load from. "
         "If a directory is provided, the latest checkpoint will be used.",
+    )
+
+    load_noise_adapter: str | Path | None = Field(
+        default=None,
+        description="Path to a noise adapter checkpoint (.safetensors) to resume VFM training.",
     )
 
     @field_validator("model_path")
@@ -98,10 +105,12 @@ TrainingStrategyConfig = Annotated[
     Annotated[TextToVideoConfig, Tag("text_to_video")]
     | Annotated[VideoToVideoConfig, Tag("video_to_video")]
     | Annotated[SCDTrainingConfig, Tag("scd")]
+    | Annotated[VFMSCDDistillConfig, Tag("vfm_scd_distill")]
     | Annotated[VFMSCDTrainingConfig, Tag("vfm_scd")]
     | Annotated[VFMTrainingConfig, Tag("vfm")]
     | Annotated[VFMv1bTrainingConfig, Tag("vfm_v1b")]
     | Annotated[VFMv1cTrainingConfig, Tag("vfm_v1c")]
+    | Annotated[VFMDistillConfig, Tag("vfm_distill")]
     | Annotated[IsoGenTrainingConfig, Tag("isogen")],
     Discriminator(_get_strategy_discriminator),
 ]
