@@ -50,6 +50,11 @@ training_strategy:
   kl_free_bits: 0.25
   obs_loss_weight: 1.0
 
+  # === Min-SNR Timestep Weighting ===
+  # Clips SNR contribution: downweights easy (low-σ) steps, caps hard (high-σ) steps.
+  # Only applied to L_mf. Set to null to disable. Recommended: 5.0-8.0.
+  min_snr_gamma: 5.0
+
   # === Adaptive loss ===
   adaptive_loss: true
   adaptive_exclude_kl: true
@@ -70,21 +75,21 @@ training_strategy:
 
   # === Logging ===
   log_reconstructions: true
-  reconstruction_log_interval: 100
+  reconstruction_log_interval: 500
   log_vfm_metrics: true
 
 optimization:
-  learning_rate: 1.0e-3
-  steps: 500
+  learning_rate: 5.0e-4
+  steps: 5000
   batch_size: 1
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
   max_grad_norm: 1.0
   optimizer_type: "adamw"
   scheduler_type: "cosine"
   scheduler_params:
     eta_min: 1.0e-5
-  weight_decay: 0.0
-  warmup_steps: 20
+  weight_decay: 0.01
+  warmup_steps: 100
   enable_gradient_checkpointing: true
 
 acceleration:
@@ -102,7 +107,7 @@ hardware:
     vocoder: "cuda:0"
 
 data:
-  preprocessed_data_root: "/media/2TB/omnitransfer/data/ditto_1sample"
+  preprocessed_data_root: "/media/2TB/omnitransfer/data/ditto_500sample"
   num_dataloader_workers: 0
   use_cached_final_embeddings: true
   final_embeddings_dir: "conditions_final"
@@ -139,8 +144,8 @@ wandb:
   enabled: true
   project: "vfm-vanilla"
   entity: null
-  tags: ["vfm-v1b", "temporal-aware", "1-sample", "overfit", "sanity"]
+  tags: ["vfm-v1b", "temporal-aware", "500-sample", "grad-accum-4", "video-recon"]
   log_validation_videos: false
 
 seed: 42
-output_dir: "/media/2TB/omnitransfer/output/vfm_v1b_sanity_1sample"
+output_dir: "/media/2TB/omnitransfer/output/vfm_v1b_500sample"

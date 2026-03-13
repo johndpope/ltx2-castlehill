@@ -80,6 +80,12 @@ class VFMTrainingConfig(TrainingStrategyConfigBase):
         description="Per-dim KL floor to prevent sigma collapse")
     obs_loss_weight: float = Field(default=1.0, ge=0.0)
 
+    # === Min-SNR Timestep Weighting ===
+    min_snr_gamma: float | None = Field(default=None,
+        description="Min-SNR clipping threshold γ. Set to 5.0-8.0 to enable. "
+        "Reduces loss variance across timesteps by downweighting easy (low-σ) "
+        "and capping hard (high-σ) steps. Only applied to L_mf.")
+
     # === Adaptive Loss ===
     adaptive_loss: bool = Field(default=True)
     adaptive_exclude_kl: bool = Field(default=True,
@@ -373,6 +379,26 @@ class VFMTrainingStrategy(TrainingStrategy):
         video_loss_mask = inputs.video_loss_mask.unsqueeze(-1).float()
         video_loss = video_loss.mul(video_loss_mask).div(video_loss_mask.mean())
         loss_mf = video_loss.mean()
+
+        # Min-SNR timestep weighting (applied only to L_mf)
+        if cfg.min_snr_gamma is not None:
+            sigmas = getattr(inputs, "shared_sigmas", None)
+            if sigmas is not None:
+                sigma_val = sigmas.mean().clamp(min=1e-4, max=1.0 - 1e-4)
+                # SNR for flow matching: signal=(1-σ)², noise=σ²
+                # When adapter noise is used, adjust for non-unit noise norm
+                adapter_mu = getattr(inputs, "_vfm_adapter_mu", None)
+                use_adapter = getattr(inputs, "_vfm_use_adapter", False)
+                if use_adapter and adapter_mu is not None:
+                    adapter_log_sigma = inputs._vfm_adapter_log_sigma
+                    # Effective noise norm: E[||z||²] = E[μ² + σ²] per token
+                    z_norm_sq = (adapter_mu.pow(2) + torch.exp(2 * adapter_log_sigma)).mean().detach()
+                else:
+                    z_norm_sq = 1.0  # Standard Gaussian
+                snr = ((1.0 - sigma_val) ** 2) / (sigma_val ** 2 * z_norm_sq + 1e-8)
+                snr_weight = (torch.clamp(snr, max=cfg.min_snr_gamma) / (snr + 1e-8)).detach()
+                loss_mf = loss_mf * snr_weight
+
         loss_mf_scaled = loss_mf / (2.0 * cfg.tau ** 2)
 
         # L_obs: observation consistency
@@ -451,6 +477,15 @@ class VFMTrainingStrategy(TrainingStrategy):
             "vfm/task": getattr(inputs, "_vfm_task_name", "unknown"),
             "vfm/use_adapter": float(use_adapter),
         }
+        # Log Min-SNR diagnostics
+        sigmas = getattr(inputs, "shared_sigmas", None)
+        if sigmas is not None:
+            self._last_vfm_metrics["vfm/sigma"] = sigmas.mean().item()
+        if cfg.min_snr_gamma is not None and sigmas is not None:
+            sigma_val = sigmas.mean().clamp(min=1e-4, max=1.0 - 1e-4)
+            snr_val = ((1.0 - sigma_val) ** 2) / (sigma_val ** 2 + 1e-8)
+            self._last_vfm_metrics["vfm/snr"] = snr_val.item()
+            self._last_vfm_metrics["vfm/snr_weight"] = min(cfg.min_snr_gamma, snr_val.item()) / (snr_val.item() + 1e-8)
         if adapter_mu is not None:
             self._last_vfm_metrics["vfm/adapter_mu_mean"] = adapter_mu.mean().item()
             self._last_vfm_metrics["vfm/adapter_mu_std"] = adapter_mu.std().item()
