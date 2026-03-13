@@ -40,3 +40,4 @@ tmp
 *.wav
 *.webp
 uv.lock
+/wandb

@@ -11,6 +11,7 @@ from ltx_trainer.training_strategies.scd_strategy import SCDTrainingConfig
 from ltx_trainer.training_strategies.vfm_scd_strategy import VFMSCDTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy import VFMTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1b import VFMv1bTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v1c import VFMv1cTrainingConfig
 from ltx_trainer.training_strategies.isogen_strategy import IsoGenTrainingConfig
 
 
@@ -100,6 +101,7 @@ TrainingStrategyConfig = Annotated[
     | Annotated[VFMSCDTrainingConfig, Tag("vfm_scd")]
     | Annotated[VFMTrainingConfig, Tag("vfm")]
     | Annotated[VFMv1bTrainingConfig, Tag("vfm_v1b")]
+    | Annotated[VFMv1cTrainingConfig, Tag("vfm_v1c")]
     | Annotated[IsoGenTrainingConfig, Tag("isogen")],
     Discriminator(_get_strategy_discriminator),
 ]
