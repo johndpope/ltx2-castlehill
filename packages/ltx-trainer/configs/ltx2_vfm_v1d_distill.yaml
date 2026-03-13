@@ -1,0 +1,159 @@
+# =============================================================================
+# VFM v1d — Trajectory Distillation + Per-Token Timestep Scheduling
+# =============================================================================
+# Trains the VFM noise adapter + sigma head against pre-computed teacher
+# trajectories. The adapter learns structured noise z ~ qφ(z|text), and the
+# sigma head learns per-token noise levels σ_i for heterogeneous denoising.
+#
+# Prerequisites:
+#   1. VAE latents: latents_19b/ (pre-encoded video frames)
+#   2. Text embeddings: conditions_final/ (Gemma text embeddings)
+#   3. Teacher trajectories: trajectories/ (from precompute_trajectories.py)
+#      ~2453/5000 already computed at /media/12TB/ddit_ditto_data/trajectories/
+#
+# Usage:
+#   # Step 1: Ensure trajectories are computed
+#   uv run python scripts/precompute_trajectories.py \
+#       --data-root /media/12TB/ddit_ditto_data --device cuda:1
+#
+#   # Step 2: Train v1d
+#   uv run python scripts/train.py configs/ltx2_vfm_v1d_distill.yaml
+# =============================================================================
+
+model:
+  model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+training_strategy:
+  name: "vfm_v1d"
+
+  # === Per-token Sigma Scheduling (Self-Flow inspired) ===
+  per_token_sigma: true
+  sigma_head_hidden_dim: 256
+  sigma_min: 0.05
+  sigma_max: 0.95
+  sigma_entropy_weight: 0.01
+
+  # === Trajectory Distillation ===
+  distill_mode: "output_match"
+  student_steps: 1
+  distill_weight: 1.0
+  gt_weight: 0.1
+  trajectories_dir: "trajectories"
+  use_teacher_noise: false
+
+  # === v1b Adapter (inherited) ===
+  adapter_variant: "transformer"
+  adapter_hidden_dim: 512
+  adapter_num_heads: 8
+  adapter_num_layers: 4
+  adapter_pos_dim: 256
+
+  # === VFM Loss (inherited) ===
+  tau: 1.0
+  obs_noise_level: 0.2
+  alpha: 0.5
+  kl_weight: 3.0
+  kl_free_bits: 0.25
+  obs_loss_weight: 0.0
+  adaptive_loss: false
+  ema_decay: 0.999
+  first_frame_conditioning_p: 0.1
+
+  # === v1c Diversity (inherited) ===
+  diversity_weight: 0.1
+  temporal_diversity_weight: 0.2
+  spatial_diversity_weight: 0.05
+  diversity_warmup_steps: 200
+
+  inverse_problem_weights:
+    i2v: 1.0
+
+  with_audio: false
+
+  log_reconstructions: true
+  reconstruction_log_interval: 500
+  log_vfm_metrics: true
+
+optimization:
+  learning_rate: 3.0e-4
+  steps: 10000
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 200
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+hardware:
+  devices:
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+data:
+  preprocessed_data_root: "/media/12TB/ddit_ditto_data"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+validation:
+  prompts: []
+  negative_prompt: "blurry, distorted, low quality"
+  video_dims: [768, 448, 25]
+  frame_rate: 20.0
+  seed: 42
+  inference_steps: 1
+  interval: null
+  videos_per_prompt: 1
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_v"
+  generate_audio: false
+  skip_initial_validation: true
+
+checkpoints:
+  interval: 500
+  keep_last_n: 5
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "vfm-v1d"
+  entity: null
+  tags: ["vfm-v1d", "distill", "per-token-sigma"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/vfm_v1d_distill"

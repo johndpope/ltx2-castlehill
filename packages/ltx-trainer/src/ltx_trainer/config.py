@@ -15,6 +15,7 @@ from ltx_trainer.training_strategies.vfm_strategy_v1b import VFMv1bTrainingConfi
 from ltx_trainer.training_strategies.vfm_strategy_v1c import VFMv1cTrainingConfig
 from ltx_trainer.training_strategies.isogen_strategy import IsoGenTrainingConfig
 from ltx_trainer.training_strategies.vfm_distill_strategy import VFMDistillConfig
+from ltx_trainer.training_strategies.vfm_strategy_v1d import VFMv1dTrainingConfig
 
 
 class ConfigBaseModel(BaseModel):
@@ -109,6 +110,7 @@ TrainingStrategyConfig = Annotated[
     | Annotated[VFMSCDTrainingConfig, Tag("vfm_scd")]
     | Annotated[VFMTrainingConfig, Tag("vfm")]
     | Annotated[VFMv1bTrainingConfig, Tag("vfm_v1b")]
+    | Annotated[VFMv1dTrainingConfig, Tag("vfm_v1d")]
     | Annotated[VFMv1cTrainingConfig, Tag("vfm_v1c")]
     | Annotated[VFMDistillConfig, Tag("vfm_distill")]
     | Annotated[IsoGenTrainingConfig, Tag("isogen")],
