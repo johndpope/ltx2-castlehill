@@ -682,21 +682,39 @@ class LtxvTrainer:
 
         # VFM: Create noise adapter and attach to strategy
         self._noise_adapter = None
-        if isinstance(self._training_strategy, VFMSCDTrainingStrategy):
-            from ltx_core.model.transformer.noise_adapter import create_noise_adapter  # noqa: PLC0415
+        from ltx_trainer.training_strategies.vfm_strategy import VFMTrainingStrategy  # noqa: PLC0415
+        from ltx_trainer.training_strategies.vfm_strategy_v1b import VFMv1bTrainingStrategy  # noqa: PLC0415
+        if isinstance(self._training_strategy, (VFMSCDTrainingStrategy, VFMTrainingStrategy, VFMv1bTrainingStrategy)):
+            # Set text embed dim for vanilla VFM / v1b (they need it before adapter creation)
+            if isinstance(self._training_strategy, (VFMTrainingStrategy, VFMv1bTrainingStrategy)):
+                text_embed_dim = self._transformer.caption_projection.linear_1.in_features
+                self._training_strategy.set_text_embed_dim(text_embed_dim)
+
             adapter_kwargs = self._training_strategy.get_noise_adapter_params()
-            self._noise_adapter = create_noise_adapter(**adapter_kwargs)
+
+            # Use appropriate factory for v1b vs v1a
+            if isinstance(self._training_strategy, VFMv1bTrainingStrategy):
+                from ltx_core.model.transformer.noise_adapter_v1b import create_noise_adapter_v1b  # noqa: PLC0415
+                self._noise_adapter = create_noise_adapter_v1b(**adapter_kwargs)
+            else:
+                from ltx_core.model.transformer.noise_adapter import create_noise_adapter  # noqa: PLC0415
+                self._noise_adapter = create_noise_adapter(**adapter_kwargs)
+
             # Move adapter to same device as transformer
             adapter_device = next(self._transformer.parameters()).device
             self._noise_adapter = self._noise_adapter.to(adapter_device)
             self._training_strategy.set_noise_adapter(self._noise_adapter)
 
+            # Vanilla VFM / v1b: store transformer ref for EMA + flow map freezing
+            if isinstance(self._training_strategy, (VFMTrainingStrategy, VFMv1bTrainingStrategy)):
+                self._training_strategy.set_transformer_ref(self._transformer)
+
             adapter_params = sum(p.numel() for p in self._noise_adapter.parameters())
             logger.info(
-                f"VFM noise adapter: {adapter_kwargs['variant']}, "
+                f"VFM noise adapter: "
                 f"{adapter_params:,} params, "
-                f"hidden_dim={adapter_kwargs['hidden_dim']}, "
-                f"layers={adapter_kwargs['num_layers']}"
+                f"hidden_dim={adapter_kwargs.get('hidden_dim', '?')}, "
+                f"layers={adapter_kwargs.get('num_layers', '?')}"
             )
 
         # Placeholder for optional modules (EditCtrl, TMA — not included in CastleHill)
@@ -1348,6 +1366,13 @@ class LtxvTrainer:
 
             # Save to disk
             save_file(state_dict, saved_weights_path)
+
+            # Save noise adapter separately if present (VFM strategy)
+            if self._noise_adapter is not None:
+                adapter_path = save_dir / f"noise_adapter_step_{self._global_step:05d}.safetensors"
+                adapter_sd = {k: v.to(save_dtype) for k, v in self._noise_adapter.state_dict().items()}
+                save_file(adapter_sd, adapter_path)
+                logger.info(f"💾 Noise adapter for step {self._global_step} saved in {adapter_path.relative_to(self._config.output_dir)}")
         else:
             # Cast to configured precision
             full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}

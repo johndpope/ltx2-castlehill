@@ -9,6 +9,9 @@ from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig
 from ltx_trainer.training_strategies.scd_strategy import SCDTrainingConfig
 from ltx_trainer.training_strategies.vfm_scd_strategy import VFMSCDTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy import VFMTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v1b import VFMv1bTrainingConfig
+from ltx_trainer.training_strategies.isogen_strategy import IsoGenTrainingConfig
 
 
 class ConfigBaseModel(BaseModel):
@@ -94,7 +97,10 @@ TrainingStrategyConfig = Annotated[
     Annotated[TextToVideoConfig, Tag("text_to_video")]
     | Annotated[VideoToVideoConfig, Tag("video_to_video")]
     | Annotated[SCDTrainingConfig, Tag("scd")]
-    | Annotated[VFMSCDTrainingConfig, Tag("vfm_scd")],
+    | Annotated[VFMSCDTrainingConfig, Tag("vfm_scd")]
+    | Annotated[VFMTrainingConfig, Tag("vfm")]
+    | Annotated[VFMv1bTrainingConfig, Tag("vfm_v1b")]
+    | Annotated[IsoGenTrainingConfig, Tag("isogen")],
     Discriminator(_get_strategy_discriminator),
 ]
 
