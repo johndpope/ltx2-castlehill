@@ -305,6 +305,25 @@ class NoiseAdapterV1b(nn.Module):
         eps = torch.randn_like(mu)
         return mu + sigma * eps * temperature
 
+    def sample_with_mu(
+        self,
+        text_embeddings: Tensor,
+        text_mask: Tensor,
+        positions: Tensor,
+        task_class: Tensor,
+        temperature: float = 1.0,
+    ) -> tuple[Tensor, Tensor]:
+        """Sample structured noise z ~ qφ(z|y) and return adapter mu.
+
+        Returns:
+            (z, mu) where z: [B, video_seq, latent_dim], mu: [B, video_seq, latent_dim]
+        """
+        mu, log_sigma = self.forward(text_embeddings, text_mask, positions, task_class)
+        sigma = torch.exp(log_sigma)
+        eps = torch.randn_like(mu)
+        z = mu + sigma * eps * temperature
+        return z, mu
+
     def kl_divergence(self, mu: Tensor, log_sigma: Tensor) -> Tensor:
         """KL(qφ(z|y) || N(0,I))."""
         kl = 0.5 * (mu.pow(2) + torch.exp(2 * log_sigma) - 2 * log_sigma - 1)

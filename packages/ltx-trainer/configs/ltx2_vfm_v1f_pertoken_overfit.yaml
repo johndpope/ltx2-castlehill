@@ -1,0 +1,146 @@
+# =============================================================================
+# VFM v1f PER-TOKEN SIGMA — Overfit 1-sample validation
+# =============================================================================
+# Tests the FIXED per-token sigma: no interpolation during training, SigmaHead
+# output used as per-token conditioning (not noise level).
+#
+# Key fix: input is always pure adapter noise z (same as inference). Per-token
+# sigma is ONLY a conditioning signal via AdaLN. This eliminates the train/
+# inference mismatch that caused sigma collapse in previous runs.
+#
+# sigma_min raised to 0.3 (every token needs substantial denoising from pure noise)
+# sigma_max set to 1.0 (allow full effort)
+#
+# Usage:
+#   uv run python scripts/train.py configs/ltx2_vfm_v1f_pertoken_overfit.yaml
+# =============================================================================
+
+model:
+  model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+training_strategy:
+  name: "vfm_v1f"
+
+  # === Spherical Cauchy (v1f) ===
+  spherical_noise: true
+  kappa_min: 0.1
+  kappa_max: 50.0
+  use_slerp_interp: false
+  magnitude_reg_weight: 0.1
+  target_magnitude: 1.0
+  kappa_entropy_weight: 0.01
+  kappa_target: 2.0
+  kappa_pull_weight: 0.05
+
+  # === FIXED per-token sigma ===
+  per_token_sigma: true
+  sigma_min: 0.3          # Higher floor — pure noise input needs substantial denoising
+  sigma_max: 1.0          # Allow full effort
+  sigma_head_hidden_dim: 256
+  sigma_entropy_weight: 0.01
+  sigma_mean_target: 0.7  # Target high sigma (input is always pure noise)
+  sigma_mean_pull_weight: 0.3  # Strong pull to prevent collapse
+
+  # === No distillation ===
+  distill_mode: "none"
+
+  # === v1b Adapter (inherited) ===
+  adapter_variant: "transformer"
+  adapter_hidden_dim: 512
+  adapter_num_heads: 8
+  adapter_num_layers: 4
+  adapter_pos_dim: 256
+
+  # === VFM Loss ===
+  tau: 1.0
+  obs_noise_level: 0.2
+  alpha: 0.8
+  kl_weight: 3.0
+  kl_free_bits: 0.05
+  obs_loss_weight: 0.0
+  adaptive_loss: false
+  ema_decay: 0.999
+  first_frame_conditioning_p: 0.1
+
+  # === Diversity (keep light for overfit) ===
+  diversity_weight: 0.05
+  temporal_diversity_weight: 0.05
+  spatial_diversity_weight: 0.02
+  diversity_warmup_steps: 50
+
+  inverse_problem_weights:
+    i2v: 1.0
+
+  with_audio: false
+
+  log_reconstructions: true
+  reconstruction_log_interval: 50
+  log_vfm_metrics: true
+
+optimization:
+  learning_rate: 5.0e-4
+  steps: 500
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 50
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+hardware:
+  devices:
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+data:
+  preprocessed_data_root: "/media/12TB/ddit_ditto_data_overfit1"
+  num_dataloader_workers: 0
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+checkpoints:
+  interval: 100
+  keep_last_n: 5
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "vfm-v1f"
+  entity: null
+  tags: ["vfm-v1f", "per-token-sigma-fixed", "overfit-1sample"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/vfm_v1f_pertoken_overfit"

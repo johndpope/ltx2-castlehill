@@ -184,6 +184,28 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
             params.extend(list(self._sigma_head.parameters()))
         return params
 
+    def get_strategy_state_dict(self) -> dict[str, Any]:
+        """Return SigmaHead state dict for checkpoint saving."""
+        state_dict = {}
+        if self._sigma_head is not None:
+            for k, v in self._sigma_head.state_dict().items():
+                state_dict[f"strategy.sigma_head.{k}"] = v
+        return state_dict
+
+    def load_strategy_state_dict(self, state_dict: dict[str, Any]) -> tuple[int, int]:
+        """Load SigmaHead weights from checkpoint."""
+        loaded, skipped = 0, 0
+        if self._sigma_head is not None:
+            sigma_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("strategy.sigma_head."):
+                    sigma_dict[k.replace("strategy.sigma_head.", "")] = v
+            if sigma_dict:
+                self._sigma_head.load_state_dict(sigma_dict)
+                loaded = len(sigma_dict)
+                logger.info(f"Loaded SigmaHead: {loaded} params")
+        return loaded, skipped
+
     def get_data_sources(self) -> list[str] | dict[str, str]:
         """Add trajectories as data source if distillation is enabled."""
         sources = super().get_data_sources()
@@ -194,11 +216,15 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
         return sources
 
     def set_noise_adapter(self, adapter) -> None:
-        """Override to also move sigma head to adapter's device (keep float32)."""
+        """Override to also move sigma head to adapter's device."""
         super().set_noise_adapter(adapter)
-        if self._sigma_head is not None and adapter is not None:
+        if adapter is not None:
             device = next(adapter.parameters()).device
-            self._sigma_head = self._sigma_head.to(device=device)
+            # Ensure ALL adapter submodules are on the right device
+            # (quanto quantization can leave some embeddings on CPU)
+            adapter.to(device)
+            if self._sigma_head is not None:
+                self._sigma_head = self._sigma_head.to(device=device)
 
     def prepare_training_inputs(
         self,
@@ -308,7 +334,9 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
         # ════════════════════════════════════════════════
         if cfg.per_token_sigma and self._sigma_head is not None and adapter_mu is not None:
             # Predict per-token sigma from adapter mu
-            per_token_sigmas = self._sigma_head(adapter_mu.detach().float())  # [B, seq]
+            # NOTE: no .detach() — sigma head needs gradient from flow matching loss
+            # to learn which tokens should get higher/lower noise levels
+            per_token_sigmas = self._sigma_head(adapter_mu.float())  # [B, seq]
 
             # Zero out sigma for conditioning tokens (first frame)
             per_token_sigmas = per_token_sigmas * (~video_conditioning_mask).float()
@@ -479,7 +507,8 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
 
             if cfg.per_token_sigma and self._sigma_head is not None and adapter_mu is not None:
                 # Per-token sigma even in distill mode
-                per_token_sigmas = self._sigma_head(adapter_mu.detach().float())
+                # NOTE: no .detach() — gradient flows through sigma head
+                per_token_sigmas = self._sigma_head(adapter_mu.float())
                 per_token_sigmas = per_token_sigmas * (~video_conditioning_mask).float()
                 video_timesteps = per_token_sigmas
 

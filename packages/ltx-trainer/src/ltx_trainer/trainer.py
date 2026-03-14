@@ -1380,6 +1380,13 @@ class LtxvTrainer:
                 adapter_sd = {k: v.to(save_dtype) for k, v in self._noise_adapter.state_dict().items()}
                 save_file(adapter_sd, adapter_path)
                 logger.info(f"💾 Noise adapter for step {self._global_step} saved in {adapter_path.relative_to(self._config.output_dir)}")
+
+            # Save SigmaHead separately if present (VFM v1d+ per-token sigma)
+            if hasattr(self._training_strategy, "_sigma_head") and self._training_strategy._sigma_head is not None:
+                sigma_path = save_dir / f"sigma_head_step_{self._global_step:05d}.safetensors"
+                sigma_sd = {k: v.to(save_dtype) for k, v in self._training_strategy._sigma_head.state_dict().items()}
+                save_file(sigma_sd, sigma_path)
+                logger.info(f"💾 SigmaHead for step {self._global_step} saved in {sigma_path.relative_to(self._config.output_dir)}")
         else:
             # Cast to configured precision
             full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}

@@ -1,12 +1,15 @@
-# VFM v1e — Content-Adaptive Router + Detail Preservation (sanity check)
-# Uses content router to predict per-token complexity, guides sigma scheduling
-# and loss weighting. Frequency loss preserves spatial detail.
+# =============================================================================
+# VFM v1f PER-TOKEN SIGMA — Full 5k dataset overnight run
+# =============================================================================
+# FIXED per-token sigma: pure adapter noise as input (no interpolation),
+# SigmaHead output used as per-token AdaLN conditioning at both train + inference.
 #
-# Key v1e features:
-#   - ContentRouter: learns per-token complexity from GT latents
-#   - Router-guided sigma: complex tokens → lower σ (easier denoising)
-#   - Complexity-weighted loss: more gradient on detailed regions
-#   - Frequency loss: penalizes loss of spatial edges/textures
+# Run AFTER validating on overfit config (ltx2_vfm_v1f_pertoken_overfit.yaml).
+#
+# Usage:
+#   nohup uv run python scripts/train.py configs/ltx2_vfm_v1f_pertoken_5k.yaml \
+#     --disable-progress-bars > /tmp/vfm_v1f_pertoken_5k.log 2>&1 &
+# =============================================================================
 
 model:
   model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
@@ -24,32 +27,29 @@ lora:
     - "to_out.0"
 
 training_strategy:
-  name: "vfm_v1e"
+  name: "vfm_v1f"
 
-  # === Content Router (v1e) ===
-  content_router: true
-  router_hidden_dim: 256
-  router_num_layers: 2
-  router_num_heads: 4
-  router_detach_input: true
-  router_supervision: true
-  router_supervision_weight: 0.1
+  # === Spherical Cauchy (v1f) ===
+  spherical_noise: true
+  kappa_min: 0.1
+  kappa_max: 50.0
+  use_slerp_interp: false
+  magnitude_reg_weight: 0.1
+  target_magnitude: 1.0
+  kappa_entropy_weight: 0.01
+  kappa_target: 2.0
+  kappa_pull_weight: 0.05
 
-  # === Complexity-weighted loss (v1e) ===
-  complexity_loss_weight: 0.5
-
-  # === Frequency detail loss (v1e) ===
-  frequency_loss_weight: 0.05
-  frequency_loss_warmup: 50
-
-  # === Per-token Sigma (v1d, driven by router in v1e) ===
+  # === FIXED per-token sigma ===
   per_token_sigma: true
+  sigma_min: 0.3
+  sigma_max: 1.0
   sigma_head_hidden_dim: 256
-  sigma_min: 0.05
-  sigma_max: 0.95
   sigma_entropy_weight: 0.01
+  sigma_mean_target: 0.7
+  sigma_mean_pull_weight: 0.3
 
-  # === No distillation for sanity check ===
+  # === No distillation ===
   distill_mode: "none"
 
   # === v1b Adapter ===
@@ -62,19 +62,19 @@ training_strategy:
   # === VFM Loss ===
   tau: 1.0
   obs_noise_level: 0.2
-  alpha: 0.5
+  alpha: 0.8
   kl_weight: 3.0
-  kl_free_bits: 0.25
+  kl_free_bits: 0.05
   obs_loss_weight: 0.0
   adaptive_loss: false
   ema_decay: 0.999
-  first_frame_conditioning_p: 0.0
+  first_frame_conditioning_p: 0.1
 
-  # === v1c Diversity ===
+  # === Diversity ===
   diversity_weight: 0.1
-  temporal_diversity_weight: 0.2
+  temporal_diversity_weight: 0.1
   spatial_diversity_weight: 0.05
-  diversity_warmup_steps: 50
+  diversity_warmup_steps: 200
 
   inverse_problem_weights:
     i2v: 1.0
@@ -82,21 +82,21 @@ training_strategy:
   with_audio: false
 
   log_reconstructions: true
-  reconstruction_log_interval: 500
+  reconstruction_log_interval: 200
   log_vfm_metrics: true
 
 optimization:
   learning_rate: 3.0e-4
-  steps: 500
+  steps: 5000
   batch_size: 1
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
   max_grad_norm: 1.0
   optimizer_type: "adamw"
   scheduler_type: "cosine"
   scheduler_params:
     eta_min: 1.0e-5
   weight_decay: 0.01
-  warmup_steps: 50
+  warmup_steps: 300
   enable_gradient_checkpointing: true
 
 acceleration:
@@ -106,21 +106,22 @@ acceleration:
 
 hardware:
   devices:
-    text_encoder: "cuda:0"
-    vae_encoder: "cuda:0"
-    vae_decoder: "cuda:0"
-    transformer: "cuda:1"
-    audio_vae: "cuda:1"
-    vocoder: "cuda:1"
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
 
 data:
   preprocessed_data_root: "/media/12TB/ddit_ditto_data"
-  num_dataloader_workers: 0
+  num_dataloader_workers: 2
   use_cached_final_embeddings: true
   final_embeddings_dir: "conditions_final"
 
 validation:
   prompts: []
+  negative_prompt: "blurry, distorted, low quality"
   video_dims: [768, 448, 25]
   frame_rate: 20.0
   seed: 42
@@ -135,8 +136,8 @@ validation:
   skip_initial_validation: true
 
 checkpoints:
-  interval: 100
-  keep_last_n: 3
+  interval: 500
+  keep_last_n: 5
 
 flow_matching:
   timestep_sampling_mode: "shifted_logit_normal"
@@ -148,10 +149,10 @@ hub:
 
 wandb:
   enabled: true
-  project: "vfm-v1e"
+  project: "vfm-v1f"
   entity: null
-  tags: ["vfm-v1e", "content-router", "detail-preservation", "overfit"]
+  tags: ["vfm-v1f", "per-token-sigma-fixed", "5k-dataset", "overnight"]
   log_validation_videos: false
 
 seed: 42
-output_dir: "/media/2TB/omnitransfer/output/vfm_v1e_overfit"
+output_dir: "/media/2TB/omnitransfer/output/vfm_v1f_pertoken_5k"

@@ -1,23 +1,19 @@
 # =============================================================================
-# VFM v1d — Trajectory Distillation + Per-Token Timestep Scheduling
+# VFM v1f BASELINE — Spherical Cauchy + standard timesteps (NO per-token sigma)
 # =============================================================================
-# Trains the VFM noise adapter + sigma head against pre-computed teacher
-# trajectories. The adapter learns structured noise z ~ qφ(z|text), and the
-# sigma head learns per-token noise levels σ_i for heterogeneous denoising.
+# Stripped-down sanity check: can the adapter + LoRA produce coherent 1-step
+# video when trained with standard flow matching timestep sampling?
 #
-# Prerequisites:
-#   1. VAE latents: latents_19b/ (pre-encoded video frames)
-#   2. Text embeddings: conditions_final/ (Gemma text embeddings)
-#   3. Teacher trajectories: trajectories/ (from precompute_trajectories.py)
-#      ~2453/5000 already computed at /media/12TB/ddit_ditto_data/trajectories/
+# Key difference from ltx2_vfm_v1f_spherical.yaml:
+#   - per_token_sigma: false — uses standard shifted_logit_normal timesteps
+#   - No sigma head, no sigma collapse problem
+#   - Model sees sigma near 1.0 during training → matches inference
+#   - Reduced diversity/kl weights to keep it simple
+#
+# This tests: adapter noise (spherical) + standard timesteps → 1-step video
 #
 # Usage:
-#   # Step 1: Ensure trajectories are computed
-#   uv run python scripts/precompute_trajectories.py \
-#       --data-root /media/12TB/ddit_ditto_data --device cuda:1
-#
-#   # Step 2: Train v1d
-#   uv run python scripts/train.py configs/ltx2_vfm_v1d_distill.yaml
+#   uv run python scripts/train.py configs/ltx2_vfm_v1f_baseline.yaml
 # =============================================================================
 
 model:
@@ -36,22 +32,24 @@ lora:
     - "to_out.0"
 
 training_strategy:
-  name: "vfm_v1d"
+  name: "vfm_v1f"
 
-  # === Per-token Sigma Scheduling (Self-Flow inspired) ===
-  per_token_sigma: true
-  sigma_head_hidden_dim: 256
-  sigma_min: 0.05
-  sigma_max: 0.95
-  sigma_entropy_weight: 0.01
+  # === Spherical Cauchy (v1f) ===
+  spherical_noise: true
+  kappa_min: 0.1
+  kappa_max: 50.0
+  use_slerp_interp: false
+  magnitude_reg_weight: 0.1
+  target_magnitude: 1.0
+  kappa_entropy_weight: 0.01
+  kappa_target: 2.0
+  kappa_pull_weight: 0.05
 
-  # === Trajectory Distillation ===
-  distill_mode: "output_match"
-  student_steps: 1
-  distill_weight: 1.0
-  gt_weight: 0.1
-  trajectories_dir: "trajectories"
-  use_teacher_noise: false
+  # === DISABLED per-token sigma — use standard timestep sampling ===
+  per_token_sigma: false
+
+  # === No distillation ===
+  distill_mode: "none"
 
   # === v1b Adapter (inherited) ===
   adapter_variant: "transformer"
@@ -60,7 +58,7 @@ training_strategy:
   adapter_num_layers: 4
   adapter_pos_dim: 256
 
-  # === VFM Loss (inherited) ===
+  # === VFM Loss ===
   tau: 1.0
   obs_noise_level: 0.2
   alpha: 0.8
@@ -71,9 +69,9 @@ training_strategy:
   ema_decay: 0.999
   first_frame_conditioning_p: 0.1
 
-  # === v1c Diversity (inherited) ===
+  # === Diversity (keep light) ===
   diversity_weight: 0.1
-  temporal_diversity_weight: 0.2
+  temporal_diversity_weight: 0.1
   spatial_diversity_weight: 0.05
   diversity_warmup_steps: 200
 
@@ -83,12 +81,12 @@ training_strategy:
   with_audio: false
 
   log_reconstructions: true
-  reconstruction_log_interval: 50
+  reconstruction_log_interval: 100
   log_vfm_metrics: true
 
 optimization:
   learning_rate: 3.0e-4
-  steps: 10000
+  steps: 3000
   batch_size: 1
   gradient_accumulation_steps: 4
   max_grad_norm: 1.0
@@ -150,10 +148,10 @@ hub:
 
 wandb:
   enabled: true
-  project: "vfm-v1d"
+  project: "vfm-v1f"
   entity: null
-  tags: ["vfm-v1d", "distill", "per-token-sigma"]
+  tags: ["vfm-v1f", "baseline", "no-per-token-sigma", "spherical-cauchy"]
   log_validation_videos: false
 
 seed: 42
-output_dir: "/media/2TB/omnitransfer/output/vfm_v1d_distill"
+output_dir: "/media/2TB/omnitransfer/output/vfm_v1f_baseline"

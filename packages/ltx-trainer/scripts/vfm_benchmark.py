@@ -109,6 +109,8 @@ def parse_args() -> argparse.Namespace:
                         default="/media/2TB/omnitransfer/inference/v1b_benchmark")
     parser.add_argument("--warmup", action="store_true",
                         help="Run a warmup pass before timing")
+    parser.add_argument("--spherical", action="store_true",
+                        help="Use Spherical Cauchy sampling (v1f) instead of Gaussian")
     return parser.parse_args()
 
 
@@ -243,9 +245,21 @@ def run_single_benchmark(
             text_obs = pooled_text.unsqueeze(1).expand(-1, total_tokens, -1)
             mu, log_sigma = noise_adapter.forward(text_obs.float(), task_class)
 
-        sigma = torch.exp(log_sigma)
-        eps = torch.randn(mu.shape, device=device, dtype=torch.float32, generator=generator)
-        z = (mu + sigma * eps).to(dtype)
+        if args.spherical:
+            # Spherical Cauchy sampling (v1f)
+            from ltx_trainer.spherical_utils import normalize, sample_spherical_cauchy
+            B, seq, D = mu.shape
+            mu_hat = normalize(mu.float(), dim=-1)
+            mu_norm = mu.float().norm(p=2, dim=-1)
+            kappa = torch.exp(log_sigma.float().mean(dim=-1)).clamp(min=0.1, max=50.0)
+            mu_hat_flat = mu_hat.reshape(B * seq, D)
+            kappa_flat = kappa.reshape(B * seq)
+            z_dir = sample_spherical_cauchy(mu_hat_flat, kappa_flat).reshape(B, seq, D)
+            z = (mu_norm.unsqueeze(-1) * z_dir).to(dtype)
+        else:
+            sigma = torch.exp(log_sigma)
+            eps = torch.randn(mu.shape, device=device, dtype=torch.float32, generator=generator)
+            z = (mu + sigma * eps).to(dtype)
         torch.cuda.synchronize(device)
         timings["adapter_ms"] = (time.time() - t0) * 1000
 
