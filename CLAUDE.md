@@ -136,19 +136,12 @@ uv run ruff check .
 uv run pytest
 ```
 
-## SCD Architecture
+## Detailed Documentation
 
-```
-Frame N generation:
+| Doc | Contents |
+|-----|----------|
+| **[docs/VFM.md](docs/VFM.md)** | VFM adapter versions v1a→v1e, architecture, loss functions, W&B links, papers |
+| **[docs/scd-achievements.md](docs/scd-achievements.md)** | SCD architecture, benchmarks, training runs, technical discoveries |
+| **[docs/gFFN-HRR-whitepaper.md](docs/gFFN-HRR-whitepaper.md)** | gFFN-HRR FFN optimization research |
 
-ENCODER (32 layers, once per frame, KV-cached):
-  Frame N-1 (clean, σ=0) → [32 blocks] → encoder_features
-                              KV-cache grows across frames
-
-DECODER (16 layers, N_steps per frame):
-  token_concat(encoder_features, noisy_frame_N) → [16 blocks] → velocity
-```
-
-- **Encoder**: O(1) per frame via KV-cache (~6% of total time)
-- **Decoder**: Linear scaling with frame count (~1.3-1.7s/frame)
-- **DDiT** (optional): 4× fewer tokens in decoder → 1.25-1.48× speedup
+> **RULE:** When modifying VFM, SCD, or benchmark code, update the corresponding doc above.

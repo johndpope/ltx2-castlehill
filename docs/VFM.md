@@ -171,9 +171,35 @@ v1e:     complex regions → lower σ (continuous allocation in noise space)
 |--------|---------|
 | `precompute_trajectories.py` | 8-step ODE trajectories for base 48-layer model |
 | `precompute_scd_trajectories.py` | SCD decoder trajectories (16-layer) |
+| `vfm_benchmark.py` | VFM speed vs LTX Desktop 8-step (all resolutions) |
 | `train_bezierflow_base.py` | Learned sigma schedule (abandoned — linear is better) |
 | `benchmark_schedule.py` | A/B comparison of sigma schedules |
 | `scd_inference.py` | Autoregressive SCD inference |
+
+---
+
+## Benchmark: VFM vs LTX Desktop
+
+VFM 1-step is benchmarked against LTX Desktop 8-step (RTX 5090, i2v, without text encoding):
+
+```bash
+uv run python scripts/vfm_benchmark.py \
+    --adapter-path checkpoints/noise_adapter_step_XXXXX.safetensors \
+    --lora-path checkpoints/lora_weights_step_XXXXX.safetensors \
+    --cached-embedding /media/12TB/ddit_ditto_data/conditions_final/000000.pt
+```
+
+**LTX Desktop 8-step reference times** (RTX 5090):
+
+| Config | Desktop 8-step |
+|--------|---------------|
+| 5s 540p | ~33s |
+| 5s 720p | ~42s |
+| 5s 1080p | ~76s |
+| 10s 540p | ~44s |
+| 20s 540p | ~73s |
+
+**VFM theoretical speedup**: 8x fewer transformer forward passes. Actual speedup depends on adapter overhead (~1-5% of total) and VAE decode time (constant). Expected: **6-21x** depending on resolution/duration.
 
 ---
 

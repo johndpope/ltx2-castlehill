@@ -241,12 +241,19 @@ class VFMv1eTrainingStrategy(VFMv1dTrainingStrategy):
         if self._content_router is None:
             return None
 
+        # Ensure router is on the same device/dtype as input
+        router_param = next(self._content_router.parameters())
+        if router_param.device != video_latents.device or router_param.dtype != video_latents.dtype:
+            self._content_router = self._content_router.to(
+                device=video_latents.device, dtype=video_latents.dtype,
+            )
+
         cfg = self.config
         router_input = video_latents.detach() if cfg.router_detach_input else video_latents
         complexity = self._content_router(router_input)  # [B, seq]
 
         # Zero out conditioning tokens
-        complexity = complexity * (~video_conditioning_mask).float()
+        complexity = complexity * (~video_conditioning_mask).float().to(complexity.dtype)
         return complexity
 
     @staticmethod

@@ -194,11 +194,11 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
         return sources
 
     def set_noise_adapter(self, adapter) -> None:
-        """Override to also move sigma head to adapter's device."""
+        """Override to also move sigma head to adapter's device (keep float32)."""
         super().set_noise_adapter(adapter)
         if self._sigma_head is not None and adapter is not None:
             device = next(adapter.parameters()).device
-            self._sigma_head = self._sigma_head.to(device)
+            self._sigma_head = self._sigma_head.to(device=device)
 
     def prepare_training_inputs(
         self,
@@ -308,7 +308,7 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
         # ════════════════════════════════════════════════
         if cfg.per_token_sigma and self._sigma_head is not None and adapter_mu is not None:
             # Predict per-token sigma from adapter mu
-            per_token_sigmas = self._sigma_head(adapter_mu.detach())  # [B, seq]
+            per_token_sigmas = self._sigma_head(adapter_mu.detach().float())  # [B, seq]
 
             # Zero out sigma for conditioning tokens (first frame)
             per_token_sigmas = per_token_sigmas * (~video_conditioning_mask).float()
@@ -479,7 +479,7 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
 
             if cfg.per_token_sigma and self._sigma_head is not None and adapter_mu is not None:
                 # Per-token sigma even in distill mode
-                per_token_sigmas = self._sigma_head(adapter_mu.detach())
+                per_token_sigmas = self._sigma_head(adapter_mu.detach().float())
                 per_token_sigmas = per_token_sigmas * (~video_conditioning_mask).float()
                 video_timesteps = per_token_sigmas
 
