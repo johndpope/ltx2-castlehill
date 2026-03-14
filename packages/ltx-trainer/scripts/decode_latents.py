@@ -287,7 +287,7 @@ class LatentsDecoder:
 
         # Save as WAV
         output_path = output_dir / f"{latent_file.stem}.wav"
-        sample_rate = self.vocoder.output_sample_rate
+        sample_rate = self.vocoder.output_sampling_rate
         torchaudio.save(str(output_path), waveform[0].cpu(), sample_rate)
 
 

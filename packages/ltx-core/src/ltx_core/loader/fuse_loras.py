@@ -53,8 +53,11 @@ def _prepare_deltas(
     for lsd, coef in lora_sd_and_strengths:
         if key_a not in lsd.sd or key_b not in lsd.sd:
             continue
-        product = torch.matmul(lsd.sd[key_b] * coef, lsd.sd[key_a])
-        deltas.append(product.to(dtype=dtype, device=device))
+        a = lsd.sd[key_a].to(device=device)
+        b = lsd.sd[key_b].to(device=device)
+        product = torch.matmul(b * coef, a)
+        del a, b
+        deltas.append(product.to(dtype=dtype))
     if len(deltas) == 0:
         return None
     elif len(deltas) == 1:

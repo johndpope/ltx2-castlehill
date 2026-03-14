@@ -474,6 +474,7 @@ class VFMv1eTrainingStrategy(VFMv1dTrainingStrategy):
 
         video_modality = Modality(
             enabled=True,
+            sigma=sigmas_for_logging,
             latent=noisy_video,
             timesteps=video_timesteps,
             positions=video_positions,

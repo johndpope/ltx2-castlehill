@@ -67,14 +67,18 @@ class DummyDataset(Dataset):
                 "fps": self.fps,
             },
             "text_conditions": {
-                "prompt_embeds": torch.randn(
+                "video_prompt_embeds": torch.randn(
                     self.prompt_sequence_length,
                     self.prompt_embed_dim,
-                ),  # random text embeddings
+                ),
+                "audio_prompt_embeds": torch.randn(
+                    self.prompt_sequence_length,
+                    self.prompt_embed_dim,
+                ),
                 "prompt_attention_mask": torch.ones(
                     self.prompt_sequence_length,
                     dtype=torch.bool,
-                ),  # random attention mask
+                ),
             },
         }
 

@@ -1111,7 +1111,7 @@ def main() -> None:
         video_args = dc_replace(video_args, x=merged_proj)
         # SCD Paper, Section 3.2: Decoder uses bidirectional attention (no causal mask).
         # Unlike the encoder which is causal, the decoder attends to all tokens freely.
-        video_args = dc_replace(video_args, self_attn_mask=None)  # Decoder: bidirectional
+        video_args = dc_replace(video_args, self_attention_mask=None)  # Decoder: bidirectional
 
         # SCD Paper, Section 3.3: Encoder features are injected into the decoder via
         # the configured combine mode (additive or token concatenation).
@@ -1477,8 +1477,8 @@ def main() -> None:
                                 scd_model._cast_modality_dtype(dec_modality)
                             )
                             # SCD Paper, Section 3.2: Decoder uses bidirectional attention
-                            # (self_attn_mask=None removes causal constraint).
-                            video_args = dc_replace(video_args, self_attn_mask=None)
+                            # (self_attention_mask=None removes causal constraint).
+                            video_args = dc_replace(video_args, self_attention_mask=None)
                             # SCD Paper, Section 3.3: Inject encoder features into decoder input
                             # using the configured combine mode (add or token_concat).
                             video_args = scd_model._combine_encoder_decoder(video_args, dec_enc_ctx)

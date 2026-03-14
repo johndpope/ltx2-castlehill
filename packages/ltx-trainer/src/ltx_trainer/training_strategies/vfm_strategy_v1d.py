@@ -382,6 +382,7 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
 
         video_modality = Modality(
             enabled=True,
+            sigma=sigmas_for_logging,
             latent=noisy_video,
             timesteps=video_timesteps,
             positions=video_positions,
@@ -549,6 +550,7 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
 
         video_modality = Modality(
             enabled=True,
+            sigma=torch.ones(batch_size, device=device, dtype=dtype),
             latent=noisy_video,
             timesteps=video_timesteps,
             positions=video_positions,

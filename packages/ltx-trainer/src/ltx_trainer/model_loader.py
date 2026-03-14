@@ -8,7 +8,7 @@ Example usage:
     # Load individual components
     vae_encoder = load_video_vae_encoder("/path/to/checkpoint.safetensors", device="cuda")
     vae_decoder = load_video_vae_decoder("/path/to/checkpoint.safetensors", device="cuda")
-    text_encoder = load_text_encoder("/path/to/checkpoint.safetensors", "/path/to/gemma", device="cuda")
+    text_encoder = load_text_encoder("/path/to/gemma", device="cuda")
     # Load all components at once
     components = load_model("/path/to/checkpoint.safetensors", text_encoder_path="/path/to/gemma")
 """
@@ -32,7 +32,8 @@ if TYPE_CHECKING:
     from ltx_core.model.audio_vae import AudioDecoder, AudioEncoder, Vocoder
     from ltx_core.model.transformer import LTXModel
     from ltx_core.model.video_vae import VideoDecoder, VideoEncoder
-    from ltx_core.text_encoders.gemma import AVGemmaTextEncoderModel
+    from ltx_core.text_encoders.gemma import GemmaTextEncoder
+    from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
 
 
 def _to_torch_device(device: Device) -> torch.device:
@@ -187,23 +188,21 @@ def load_vocoder(
 
 
 def load_text_encoder(
-    checkpoint_path: str | Path,
     gemma_model_path: str | Path,
     device: Device = "cpu",
     dtype: torch.dtype = torch.bfloat16,
     load_in_8bit: bool = False,
-) -> "AVGemmaTextEncoderModel":
+) -> "GemmaTextEncoder":
     """Load the Gemma text encoder.
     Args:
-        checkpoint_path: Path to the LTX-2 safetensors checkpoint file
         gemma_model_path: Path to Gemma model directory
         device: Device to load model on
         dtype: Data type for model weights
         load_in_8bit: Whether to load the Gemma model in 8-bit precision using bitsandbytes.
             When True, the model is loaded with device_map="auto" and the device argument
-            is ignored for the Gemma backbone (feature extractor still uses dtype).
+            is ignored for the Gemma backbone.
     Returns:
-        Loaded AVGemmaTextEncoderModel
+        Loaded GemmaTextEncoder
     """
     if not Path(gemma_model_path).is_dir():
         raise ValueError(f"Gemma model path is not a directory: {gemma_model_path}")
@@ -212,16 +211,16 @@ def load_text_encoder(
     if load_in_8bit:
         from ltx_trainer.gemma_8bit import load_8bit_gemma
 
-        return load_8bit_gemma(checkpoint_path, gemma_model_path, dtype)
+        return load_8bit_gemma(gemma_model_path, dtype)
 
     # Standard loading path
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
-    from ltx_core.text_encoders.gemma.encoders.av_encoder import (
-        AV_GEMMA_TEXT_ENCODER_KEY_OPS,
+    from ltx_core.text_encoders.gemma import (
+        GEMMA_LLM_KEY_OPS,
         GEMMA_MODEL_OPS,
-        AVGemmaTextEncoderModelConfigurator,
+        GemmaTextEncoderConfigurator,
+        module_ops_from_gemma_root,
     )
-    from ltx_core.text_encoders.gemma.encoders.base_encoder import module_ops_from_gemma_root
     from ltx_core.utils import find_matching_file
 
     torch_device = _to_torch_device(device)
@@ -230,13 +229,41 @@ def load_text_encoder(
     gemma_weight_paths = [str(p) for p in gemma_model_folder.rglob("*.safetensors")]
 
     text_encoder = SingleGPUModelBuilder(
-        model_path=(str(checkpoint_path), *gemma_weight_paths),
-        model_class_configurator=AVGemmaTextEncoderModelConfigurator,
-        model_sd_ops=AV_GEMMA_TEXT_ENCODER_KEY_OPS,
+        model_path=tuple(gemma_weight_paths),
+        model_class_configurator=GemmaTextEncoderConfigurator,
+        model_sd_ops=GEMMA_LLM_KEY_OPS,
         module_ops=(GEMMA_MODEL_OPS, *module_ops_from_gemma_root(str(gemma_model_path))),
     ).build(device=torch_device, dtype=dtype)
 
     return text_encoder
+
+
+def load_embeddings_processor(
+    checkpoint_path: str | Path,
+    device: Device = "cpu",
+    dtype: torch.dtype = torch.bfloat16,
+) -> "EmbeddingsProcessor":
+    """Load the embeddings processor (feature extractor + video/audio connectors).
+    Args:
+        checkpoint_path: Path to the LTX-2 safetensors checkpoint file
+        device: Device to load model on
+        dtype: Data type for model weights
+    Returns:
+        Loaded EmbeddingsProcessor with feature extractor and connectors
+    """
+    from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
+    from ltx_core.text_encoders.gemma import (
+        EMBEDDINGS_PROCESSOR_KEY_OPS,
+        EmbeddingsProcessorConfigurator,
+    )
+
+    torch_device = _to_torch_device(device)
+
+    return SingleGPUModelBuilder(
+        model_path=str(checkpoint_path),
+        model_class_configurator=EmbeddingsProcessorConfigurator,
+        model_sd_ops=EMBEDDINGS_PROCESSOR_KEY_OPS,
+    ).build(device=torch_device, dtype=dtype)
 
 
 # =============================================================================
@@ -253,7 +280,7 @@ class LtxModelComponents:
     video_vae_decoder: "VideoDecoder | None" = None
     audio_vae_decoder: "AudioDecoder | None" = None
     vocoder: "Vocoder | None" = None
-    text_encoder: "AVGemmaTextEncoderModel | None" = None
+    text_encoder: "GemmaTextEncoder | None" = None
     scheduler: "LTX2Scheduler | None" = None
 
 
@@ -337,7 +364,7 @@ def load_model(
         if text_encoder_path is None:
             raise ValueError("text_encoder_path must be provided when with_text_encoder=True")
         logger.debug("Loading Gemma text encoder...")
-        text_encoder = load_text_encoder(checkpoint_path, text_encoder_path, torch_device, dtype)
+        text_encoder = load_text_encoder(text_encoder_path, torch_device, dtype)
 
     # Create scheduler (stateless, no loading needed)
     scheduler = LTX2Scheduler()

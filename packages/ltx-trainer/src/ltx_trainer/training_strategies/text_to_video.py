@@ -163,6 +163,7 @@ class TextToVideoStrategy(TrainingStrategy):
         # Create video Modality
         video_modality = Modality(
             enabled=True,
+            sigma=sigmas,
             latent=noisy_video,
             timesteps=video_timesteps,
             positions=video_positions,
@@ -254,6 +255,7 @@ class TextToVideoStrategy(TrainingStrategy):
         audio_modality = Modality(
             enabled=True,
             latent=noisy_audio,
+            sigma=sigmas,
             timesteps=audio_timesteps,
             positions=audio_positions,
             context=audio_prompt_embeds,

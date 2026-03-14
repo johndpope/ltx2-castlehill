@@ -41,6 +41,7 @@ from torchvision.transforms.functional import crop, resize, to_tensor
 from transformers.utils.logging import disable_progress_bar
 
 from ltx_core.model.audio_vae import AudioProcessor
+from ltx_core.types import Audio
 from ltx_trainer import logger
 from ltx_trainer.model_loader import load_audio_vae_encoder, load_video_vae_encoder
 from ltx_trainer.utils import open_image_as_srgb
@@ -503,7 +504,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
             )
             # Create audio processor for waveform-to-spectrogram conversion
             audio_processor = AudioProcessor(
-                sample_rate=audio_vae_encoder.sample_rate,
+                target_sample_rate=audio_vae_encoder.sample_rate,
                 mel_bins=audio_vae_encoder.mel_bins,
                 mel_hop_length=audio_vae_encoder.mel_hop_length,
                 n_fft=audio_vae_encoder.n_fft,
@@ -567,10 +568,10 @@ def compute_latents(  # noqa: PLR0913, PLR0915
                     if audio_batch is not None:
                         # Extract the i-th item from batched audio data
                         # DataLoader collates [channels, samples] -> [batch, channels, samples]
-                        audio_data = {
-                            "waveform": audio_batch["waveform"][i],
-                            "sample_rate": audio_batch["sample_rate"][i].item(),
-                        }
+                        audio_data = Audio(
+                            waveform=audio_batch["waveform"][i],
+                            sampling_rate=audio_batch["sample_rate"][i].item(),
+                        )
 
                         # Encode audio
                         with torch.inference_mode():
@@ -822,13 +823,13 @@ def tiled_encode_video(  # noqa: PLR0912, PLR0915
 def encode_audio(
     audio_vae_encoder: torch.nn.Module,
     audio_processor: torch.nn.Module,
-    audio_data: dict[str, torch.Tensor | int],
+    audio: Audio,
 ) -> dict[str, torch.Tensor | int | float]:
     """Encode audio waveform into latent representation.
     Args:
         audio_vae_encoder: Audio VAE encoder model from ltx-core
         audio_processor: AudioProcessor for waveform-to-spectrogram conversion
-        audio_data: Dict with {"waveform": Tensor[channels, samples], "sample_rate": int}
+        audio: Audio container with waveform tensor and sampling rate.
     Returns:
         Dict containing audio latents and shape information:
         {
@@ -841,18 +842,17 @@ def encode_audio(
     device = next(audio_vae_encoder.parameters()).device
     dtype = next(audio_vae_encoder.parameters()).dtype
 
-    waveform = audio_data["waveform"].to(device=device, dtype=dtype)
-    sample_rate = audio_data["sample_rate"]
+    waveform = audio.waveform.to(device=device, dtype=dtype)
 
     # Add batch dimension if needed: [channels, samples] -> [batch, channels, samples]
     if waveform.dim() == 2:
         waveform = waveform.unsqueeze(0)
 
     # Calculate duration
-    duration = waveform.shape[-1] / sample_rate
+    duration = waveform.shape[-1] / audio.sampling_rate
 
     # Convert waveform to mel spectrogram using AudioProcessor
-    mel_spectrogram = audio_processor.waveform_to_mel(waveform, waveform_sample_rate=sample_rate)
+    mel_spectrogram = audio_processor.waveform_to_mel(Audio(waveform=waveform, sampling_rate=audio.sampling_rate))
     mel_spectrogram = mel_spectrogram.to(dtype=dtype)
 
     # Encode mel spectrogram to latents

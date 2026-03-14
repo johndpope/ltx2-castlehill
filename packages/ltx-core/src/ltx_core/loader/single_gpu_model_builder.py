@@ -26,6 +26,19 @@ logger: logging.Logger = logging.getLogger(__name__)
 class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType], LoRAAdaptableProtocol):
     """
     Builder for PyTorch models residing on a single GPU.
+    Attributes:
+        model_class_configurator: Class responsible for constructing the model from a config dict.
+        model_path: Path (or tuple of shard paths) to the model's `.safetensors` checkpoint(s).
+        model_sd_ops: Optional state-dict operations applied when loading the model weights.
+        module_ops: Sequence of module-level mutations applied to the meta model before weight loading.
+        loras: Sequence of LoRA adapters (path, strength, optional sd_ops) to fuse into the model.
+        model_loader: Strategy for loading state dicts from disk. Defaults to
+            :class:`SafetensorsModelStateDictLoader`.
+        registry: Cache for already-loaded state dicts. Defaults to :class:`DummyRegistry` (no caching).
+        lora_load_device: Device used when loading LoRA weight tensors from disk. Defaults to
+            ``torch.device("cpu")``, which keeps LoRA weights in CPU memory and transfers them to
+            the target GPU sequentially during fusion, reducing peak GPU memory usage compared to
+            loading all LoRA weights directly onto the GPU at once.
     """
 
     model_class_configurator: type[ModelConfigurator[ModelType]]
@@ -35,6 +48,7 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     loras: tuple[LoraPathStrengthAndSDOps, ...] = field(default_factory=tuple)
     model_loader: StateDictLoader = field(default_factory=SafetensorsModelStateDictLoader)
     registry: Registry = field(default_factory=DummyRegistry)
+    lora_load_device: torch.device = field(default_factory=lambda: torch.device("cpu"))
 
     def lora(self, lora_path: str, strength: float = 1.0, sd_ops: SDOps | None = None) -> "SingleGPUModelBuilder":
         return replace(self, loras=(*self.loras, LoraPathStrengthAndSDOps(lora_path, strength, sd_ops)))
@@ -85,7 +99,8 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
             return self._return_model(meta_model, device)
 
         lora_state_dicts = [
-            self.load_sd([lora.path], sd_ops=lora.sd_ops, registry=self.registry, device=device) for lora in self.loras
+            self.load_sd([lora.path], sd_ops=lora.sd_ops, registry=self.registry, device=self.lora_load_device)
+            for lora in self.loras
         ]
         lora_sd_and_strengths = [
             LoraStateDictWithStrength(sd, strength)

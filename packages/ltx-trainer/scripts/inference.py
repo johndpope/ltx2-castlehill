@@ -410,7 +410,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     # Get audio sample rate from vocoder if audio was generated
     audio_sample_rate = None
     if audio is not None and components.vocoder is not None:
-        audio_sample_rate = components.vocoder.output_sample_rate
+        audio_sample_rate = components.vocoder.output_sampling_rate
 
     save_video(
         video_tensor=video,

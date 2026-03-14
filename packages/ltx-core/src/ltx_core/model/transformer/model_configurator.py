@@ -1,8 +1,11 @@
+import torch
+
 from ltx_core.loader.sd_ops import SDOps
 from ltx_core.model.model_protocol import ModelConfigurator
 from ltx_core.model.transformer.attention import AttentionFunction
 from ltx_core.model.transformer.model import LTXModel, LTXModelType
 from ltx_core.model.transformer.rope import LTXRopeType
+from ltx_core.model.transformer.text_projection import create_caption_projection
 from ltx_core.utils import check_config_value
 
 
@@ -14,6 +17,9 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
 
     @classmethod
     def from_config(cls: type[LTXModel], config: dict) -> LTXModel:
+        # Build caption projections for 19B models (projection handled in transformer).
+        caption_projection, audio_caption_projection = _build_caption_projections(config, is_av=True)
+
         config = config.get("transformer", {})
 
         check_config_value(config, "dropout", 0.0)
@@ -45,7 +51,6 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
             cross_attention_dim=config.get("cross_attention_dim", 4096),
             norm_eps=config.get("norm_eps", 1e-06),
             attention_type=AttentionFunction(config.get("attention_type", "default")),
-            caption_channels=config.get("caption_channels", 3840),
             positional_embedding_theta=config.get("positional_embedding_theta", 10000.0),
             positional_embedding_max_pos=config.get("positional_embedding_max_pos", [20, 2048, 2048]),
             timestep_scale_multiplier=config.get("timestep_scale_multiplier", 1000),
@@ -60,6 +65,9 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
             rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
             apply_gated_attention=config.get("apply_gated_attention", False),
+            caption_projection=caption_projection,
+            audio_caption_projection=audio_caption_projection,
+            cross_attention_adaln=config.get("cross_attention_adaln", False),
             ffn_type=config.get("ffn_type", "ffn"),
             gffn_kwargs=config.get("gffn_kwargs", None),
             self_attn_type=config.get("self_attn_type", "standard"),
@@ -75,6 +83,9 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
 
     @classmethod
     def from_config(cls: type[LTXModel], config: dict) -> LTXModel:
+        # Build caption projection for 19B model (projection handled in transformer).
+        caption_projection, _ = _build_caption_projections(config, is_av=False)
+
         config = config.get("transformer", {})
 
         check_config_value(config, "dropout", 0.0)
@@ -103,7 +114,6 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             cross_attention_dim=config.get("cross_attention_dim", 4096),
             norm_eps=config.get("norm_eps", 1e-06),
             attention_type=AttentionFunction(config.get("attention_type", "default")),
-            caption_channels=config.get("caption_channels", 3840),
             positional_embedding_theta=config.get("positional_embedding_theta", 10000.0),
             positional_embedding_max_pos=config.get("positional_embedding_max_pos", [20, 2048, 2048]),
             timestep_scale_multiplier=config.get("timestep_scale_multiplier", 1000),
@@ -111,11 +121,36 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
             apply_gated_attention=config.get("apply_gated_attention", False),
+            caption_projection=caption_projection,
+            cross_attention_adaln=config.get("cross_attention_adaln", False),
             ffn_type=config.get("ffn_type", "ffn"),
             gffn_kwargs=config.get("gffn_kwargs", None),
             self_attn_type=config.get("self_attn_type", "standard"),
             clifford_kwargs=config.get("clifford_kwargs", None),
         )
+
+
+def _build_caption_projections(
+    config: dict,
+    is_av: bool,
+) -> tuple[torch.nn.Module | None, torch.nn.Module | None]:
+    """Build caption projections for the transformer when projection is NOT in the text encoder.
+    19B models: projection is in the transformer (caption_proj_before_connector=False).
+    22B models: projection is in the text encoder, so no projections are created here.
+    Args:
+        config: Full model config dict (must contain "transformer" key).
+        is_av: Whether this is an audio-video model. When False, audio projection is skipped.
+    Returns:
+        Tuple of (video_caption_projection, audio_caption_projection), both None for 22B models.
+    """
+    transformer_config = config.get("transformer", {})
+    if transformer_config.get("caption_proj_before_connector", False):
+        return None, None
+
+    with torch.device("meta"):
+        caption_projection = create_caption_projection(transformer_config)
+        audio_caption_projection = create_caption_projection(transformer_config, audio=True) if is_av else None
+    return caption_projection, audio_caption_projection
 
 
 LTXV_MODEL_COMFY_RENAMING_MAP = (

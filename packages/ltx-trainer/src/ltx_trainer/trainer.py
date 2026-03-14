@@ -29,14 +29,15 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import functional as F  # noqa: N812
 from torchvision.utils import save_image
 
+from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
 from ltx_trainer.datasets import PrecomputedDataset
 from ltx_trainer.gpu_utils import free_gpu_memory, free_gpu_memory_context, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
+from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
 from ltx_trainer.model_loader import load_model as load_ltx_model
-from ltx_trainer.model_loader import load_text_encoder
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.timestep_samplers import SAMPLERS
@@ -85,9 +86,11 @@ class LtxvTrainer:
 
         # Check if using cached final embeddings (skip loading text encoder entirely)
         self._use_cached_final_embeddings = self._config.data.use_cached_final_embeddings
+        # Track whether we need a connector pass on cached embeddings (determined after model load)
+        self._needs_connector_for_cached = False
         if self._use_cached_final_embeddings:
             logger.info("🚀 Using cached final embeddings - skipping text encoder load (~28GB VRAM saved)")
-            self._text_encoder = None
+            self._embeddings_processor = None
             self._cached_validation_embeddings = None
             # Warn if validation is configured - it won't work without text encoder
             if self._config.validation.prompts and self._config.validation.interval:
@@ -448,16 +451,36 @@ class LtxvTrainer:
         conditions = batch["conditions"]
 
         if self._use_cached_final_embeddings:
-            # Use pre-computed final embeddings directly (no connector call needed)
-            # Format from conditions_final/*.pt: video_prompt_embeds, audio_prompt_embeds, prompt_attention_mask
-            # These are already in final form [seq_len, 4096]
-            pass  # conditions already has video_prompt_embeds, audio_prompt_embeds, prompt_attention_mask
+            if self._needs_connector_for_cached and self._caption_projection_shim is not None:
+                # LTX-2.3: cached embeddings are 3840-dim from LTX-2 feature extractor.
+                # Apply caption_projection shim to transform to 4096 for the 2.3 transformer.
+                with torch.no_grad():
+                    video_features = conditions["video_prompt_embeds"]
+                    batch_size = video_features.shape[0] if video_features.dim() == 3 else 1
+                    conditions["video_prompt_embeds"] = self._caption_projection_shim(video_features).view(
+                        batch_size, -1, 4096
+                    )
+                    if "audio_prompt_embeds" in conditions and conditions["audio_prompt_embeds"] is not None:
+                        audio_features = conditions["audio_prompt_embeds"]
+                        conditions["audio_prompt_embeds"] = self._caption_projection_shim(audio_features).view(
+                            batch_size, -1, 4096
+                        )
         else:
-            # Apply embedding connectors to transform raw pre-computed text embeddings
-            # Format from conditions/*.pt: prompt_embeds [1024, 3840], prompt_attention_mask [1024]
-            video_embeds, audio_embeds, attention_mask = self._text_encoder._run_connectors(
-                conditions["prompt_embeds"], conditions["prompt_attention_mask"]
+            if "video_prompt_embeds" in conditions:
+                # New format: separate video/audio features from precompute()
+                video_features = conditions["video_prompt_embeds"]
+                audio_features = conditions.get("audio_prompt_embeds")
+            else:
+                # Legacy format: single prompt_embeds tensor — duplicate for both modalities
+                video_features = conditions["prompt_embeds"]
+                audio_features = conditions["prompt_embeds"]
+
+            mask = conditions["prompt_attention_mask"]
+            additive_mask = convert_to_additive_mask(mask, video_features.dtype)
+            video_embeds, audio_embeds, attention_mask = self._embeddings_processor.create_embeddings(
+                video_features, audio_features, additive_mask
             )
+
             conditions["video_prompt_embeds"] = video_embeds
             conditions["audio_prompt_embeds"] = audio_embeds
             conditions["prompt_attention_mask"] = attention_mask
@@ -517,25 +540,31 @@ class LtxvTrainer:
 
     @free_gpu_memory_context(after=True)
     def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings] | None:
-        """Load text encoder, computes and returns validation embeddings."""
+        """Load text encoder + embeddings processor, compute and cache validation embeddings."""
 
         # This method:
-        #   1. Loads the text encoder on GPU
-        #   2. If validation prompts are configured, computes and caches their embeddings
-        #   3. Unloads the heavy Gemma model while keeping the lightweight embedding connectors
-        #   The text encoder is kept (as self._text_encoder) but with model/tokenizer/feature_extractor
-        #   set to None. Only the embedding connectors remain for use during training.
+        #   1. Loads the pure Gemma text encoder on GPU
+        #   2. Loads the embeddings processor (feature extractor + connectors)
+        #   3. If validation prompts are configured, computes and caches their embeddings
+        #   4. Unloads the Gemma model entirely, keeps the embeddings processor for training
 
         # Load text encoder on configured device (supports multi-GPU)
         text_encoder_device = self._config.hardware.devices.text_encoder
         logger.debug(f"Loading text encoder on {text_encoder_device}...")
 
-        self._text_encoder = load_text_encoder(
-            checkpoint_path=self._config.model.model_path,
+        text_encoder = load_text_encoder(
             gemma_model_path=self._config.model.text_encoder_path,
             device=text_encoder_device,
             dtype=torch.bfloat16,
             load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
+        )
+
+        # Load embeddings processor (feature extractor + connectors)
+        logger.debug("Loading embeddings processor...")
+        self._embeddings_processor = load_embeddings_processor(
+            checkpoint_path=self._config.model.model_path,
+            device="cuda",
+            dtype=torch.bfloat16,
         )
 
         # Cache validation embeddings if prompts are configured
@@ -545,22 +574,26 @@ class LtxvTrainer:
             cached_embeddings = []
             with torch.inference_mode():
                 for prompt in self._config.validation.prompts:
-                    v_ctx_pos, a_ctx_pos, _ = self._text_encoder(prompt)
-                    v_ctx_neg, a_ctx_neg, _ = self._text_encoder(self._config.validation.negative_prompt)
+                    pos_hs, pos_mask = text_encoder.encode(prompt)
+                    pos_out = self._embeddings_processor.process_hidden_states(pos_hs, pos_mask)
+
+                    neg_hs, neg_mask = text_encoder.encode(self._config.validation.negative_prompt)
+                    neg_out = self._embeddings_processor.process_hidden_states(neg_hs, neg_mask)
 
                     cached_embeddings.append(
                         CachedPromptEmbeddings(
-                            video_context_positive=v_ctx_pos.cpu(),
-                            audio_context_positive=a_ctx_pos.cpu(),
-                            video_context_negative=v_ctx_neg.cpu() if v_ctx_neg is not None else None,
-                            audio_context_negative=a_ctx_neg.cpu() if a_ctx_neg is not None else None,
+                            video_context_positive=pos_out.video_encoding.cpu(),
+                            audio_context_positive=pos_out.audio_encoding.cpu(),
+                            video_context_negative=neg_out.video_encoding.cpu(),
+                            audio_context_negative=(
+                                neg_out.audio_encoding.cpu() if neg_out.audio_encoding is not None else None
+                            ),
                         )
                     )
 
-        # Unload heavy components to free VRAM, keeping only the embedding connectors
-        self._text_encoder.model = None
-        self._text_encoder.tokenizer = None
-        self._text_encoder.feature_extractor_linear = None
+        # Unload Gemma model and feature extractor, keep only connectors for training
+        del text_encoder
+        self._embeddings_processor.feature_extractor = None
 
         logger.debug("Validation prompt embeddings cached. Gemma model unloaded")
         return cached_embeddings
@@ -619,7 +652,7 @@ class LtxvTrainer:
         if self._vocoder is not None:
             self._vocoder = self._vocoder.to(device=hw_devices.vocoder)
 
-        # Note: self._text_encoder was set in _load_text_encoder_and_cache_embeddings
+        # Note: self._embeddings_processor was set in _load_text_encoder_and_cache_embeddings
         # Note: transformer device is handled by Accelerate, but we track the target device
         self._transformer_device = hw_devices.transformer
 
@@ -657,6 +690,42 @@ class LtxvTrainer:
             logger.info(f"Moving {model_size} transformer to {hw_devices.transformer}...")
             self._transformer = self._transformer.to(hw_devices.transformer)
 
+        # LTX-2.3: no caption_projection in transformer, but cached embeddings are 3840-dim
+        # from LTX-2's feature extractor. Load the caption_projection from the LTX-2 checkpoint
+        # to transform 3840→4096 before feeding to the 2.3 transformer.
+        self._caption_projection_shim = None
+        if self._use_cached_final_embeddings and not (
+            hasattr(self._transformer, 'caption_projection') and self._transformer.caption_projection is not None
+        ):
+            logger.info("LTX-2.3 detected: cached embeddings are 3840-dim, loading caption_projection shim")
+            # Load caption_projection from LTX-2 checkpoint (lightweight, only a few MB)
+            from safetensors import safe_open  # noqa: PLC0415
+            from ltx_core.model.transformer.text_projection import PixArtAlphaTextProjection  # noqa: PLC0415
+            caption_proj = PixArtAlphaTextProjection(in_features=3840, hidden_size=4096)
+            # Try loading from LTX-2 checkpoint first, fall back to current model
+            ltx2_path = "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+            import os
+            if os.path.exists(ltx2_path):
+                source_path = ltx2_path
+            else:
+                source_path = str(self._config.model.model_path)
+            with safe_open(source_path, framework="pt") as f:
+                prefix = "model.diffusion_model.caption_projection."
+                for key in f.keys():
+                    if key.startswith(prefix):
+                        param_name = key[len(prefix):]
+                        param = f.get_tensor(key)
+                        parts = param_name.split(".")
+                        obj = caption_proj
+                        for part in parts[:-1]:
+                            obj = getattr(obj, part)
+                        setattr(obj, parts[-1], torch.nn.Parameter(param))
+            self._caption_projection_shim = caption_proj.to(hw_devices.transformer).eval()
+            for p in self._caption_projection_shim.parameters():
+                p.requires_grad = False
+            self._needs_connector_for_cached = True
+            logger.info("Caption projection shim loaded (3840→4096)")
+
         # Wrap transformer with SCD model if using SCD or VFM-SCD strategy
         from ltx_trainer.training_strategies.scd_strategy import SCDTrainingStrategy  # noqa: PLC0415
         from ltx_trainer.training_strategies.vfm_scd_strategy import VFMSCDTrainingStrategy  # noqa: PLC0415
@@ -688,7 +757,11 @@ class LtxvTrainer:
         if isinstance(self._training_strategy, (VFMSCDTrainingStrategy, VFMSCDDistillStrategy, VFMTrainingStrategy, VFMv1bTrainingStrategy)):
             # Set text embed dim for vanilla VFM / v1b (they need it before adapter creation)
             if isinstance(self._training_strategy, (VFMTrainingStrategy, VFMv1bTrainingStrategy)):
-                text_embed_dim = self._transformer.caption_projection.linear_1.in_features
+                # LTX-2 has caption_projection on transformer; LTX-2.3 moved it to feature extractor
+                if hasattr(self._transformer, 'caption_projection') and self._transformer.caption_projection is not None:
+                    text_embed_dim = self._transformer.caption_projection.linear_1.in_features
+                else:
+                    text_embed_dim = self._transformer.inner_dim
                 self._training_strategy.set_text_embed_dim(text_embed_dim)
 
             adapter_kwargs = self._training_strategy.get_noise_adapter_params()
@@ -922,16 +995,9 @@ class LtxvTrainer:
 
             # Move text encoder connectors to transformer device for training
             # (they need to be on the same device as the transformer for the forward pass)
-            if hasattr(self, '_text_encoder') and self._text_encoder is not None:
-                if hasattr(self._text_encoder, "embeddings_connector"):
-                    self._text_encoder.embeddings_connector = self._text_encoder.embeddings_connector.to(
-                        hw_devices.transformer
-                    )
-                if hasattr(self._text_encoder, "audio_embeddings_connector"):
-                    self._text_encoder.audio_embeddings_connector = self._text_encoder.audio_embeddings_connector.to(
-                        hw_devices.transformer
-                    )
-                logger.debug(f"Text encoder connectors moved to {hw_devices.transformer}")
+            if hasattr(self, '_embeddings_processor') and self._embeddings_processor is not None:
+                self._embeddings_processor = self._embeddings_processor.to(hw_devices.transformer)
+                logger.debug(f"Embeddings processor moved to {hw_devices.transformer}")
 
         # Embedding connectors are already on GPU from _load_text_encoder_and_cache_embeddings
 
@@ -1300,7 +1366,7 @@ class LtxvTrainer:
                         output_path=output_path,
                         fps=self._config.validation.frame_rate,
                         audio=audio,
-                        audio_sample_rate=self._vocoder.output_sample_rate if audio is not None else None,
+                        audio_sample_rate=self._vocoder.output_sampling_rate if audio is not None else None,
                     )
                 video_paths.append(output_path)
 

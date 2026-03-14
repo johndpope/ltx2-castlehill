@@ -36,7 +36,8 @@ if TYPE_CHECKING:
     from ltx_core.model.audio_vae import AudioDecoder, Vocoder
     from ltx_core.model.transformer import LTXModel
     from ltx_core.model.video_vae import VideoDecoder, VideoEncoder
-    from ltx_core.text_encoders.gemma import AVGemmaTextEncoderModel
+    from ltx_core.text_encoders.gemma import GemmaTextEncoder
+    from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
 
 VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
 
@@ -124,25 +125,28 @@ class ValidationSampler:
         transformer: "LTXModel",
         vae_decoder: "VideoDecoder",
         vae_encoder: "VideoEncoder | None",
-        text_encoder: "AVGemmaTextEncoderModel | None" = None,
+        text_encoder: "GemmaTextEncoder | None" = None,
         audio_decoder: "AudioDecoder | None" = None,
         vocoder: "Vocoder | None" = None,
         sampling_context: SamplingContext | None = None,
+        embeddings_processor: "EmbeddingsProcessor | None" = None,
     ):
         """Initialize the validation sampler.
         Args:
             transformer: LTX-2 transformer model
             vae_decoder: Video VAE decoder
             vae_encoder: Video VAE encoder (for image/video conditioning), can be None if not needed
-            text_encoder: Gemma text encoder with embeddings connector (optional if cached_embeddings in config)
+            text_encoder: Gemma text encoder (optional if cached_embeddings in config)
             audio_decoder: Optional audio VAE decoder (for audio generation)
             vocoder: Optional vocoder (for audio generation)
             sampling_context: Optional SamplingContext for progress display during denoising
+            embeddings_processor: Optional embeddings processor (required if text_encoder provided)
         """
         self._transformer = transformer
         self._vae_decoder = vae_decoder
         self._vae_encoder = vae_encoder
         self._text_encoder = text_encoder
+        self._embeddings_processor = embeddings_processor
         self._audio_decoder = audio_decoder
         self._vocoder = vocoder
         self._sampling_context = sampling_context
@@ -497,6 +501,7 @@ class ValidationSampler:
         video = Modality(
             enabled=True,
             latent=video_state.latent,
+            sigma=sigmas[0].repeat(video_state.latent.shape[0]),
             timesteps=video_state.denoise_mask,
             positions=video_state.positions,
             context=v_ctx_pos,
@@ -509,6 +514,7 @@ class ValidationSampler:
             audio = Modality(
                 enabled=True,
                 latent=audio_state.latent,
+                sigma=sigmas[0].repeat(audio_state.latent.shape[0]),
                 timesteps=audio_state.denoise_mask,
                 positions=audio_state.positions,
                 context=a_ctx_pos,
@@ -525,6 +531,7 @@ class ValidationSampler:
                 video = replace(
                     video,
                     latent=video_state.latent,
+                    sigma=sigma.repeat(video_state.latent.shape[0]),
                     timesteps=sigma * video_state.denoise_mask,
                     positions=video_state.positions,
                 )
@@ -533,6 +540,7 @@ class ValidationSampler:
                     audio = replace(
                         audio,
                         latent=audio_state.latent,
+                        sigma=sigma.repeat(audio_state.latent.shape[0]),
                         timesteps=sigma * audio_state.denoise_mask,
                         positions=audio_state.positions,
                     )
@@ -673,6 +681,8 @@ class ValidationSampler:
         # Validate prompt embedding source
         if config.cached_embeddings is None and self._text_encoder is None:
             raise ValueError("Either text_encoder or config.cached_embeddings must be provided")
+        if config.cached_embeddings is None and self._embeddings_processor is None:
+            raise ValueError("embeddings_processor is required when encoding prompts on-the-fly")
 
     def _get_prompt_embeddings(
         self, config: GenerationConfig, device: torch.device
@@ -693,17 +703,22 @@ class ValidationSampler:
     def _encode_prompts(
         self, config: GenerationConfig, device: torch.device
     ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
-        """Encode positive and negative prompts using the text encoder."""
+        """Encode positive and negative prompts using the text encoder + embeddings processor."""
         self._text_encoder.to(device)
-        v_ctx_pos, a_ctx_pos, _ = self._text_encoder(config.prompt)
+        self._embeddings_processor.to(device)
+
+        pos_hs, pos_mask = self._text_encoder.encode(config.prompt)
+        pos_out = self._embeddings_processor.process_hidden_states(pos_hs, pos_mask)
+        v_ctx_pos, a_ctx_pos = pos_out.video_encoding, pos_out.audio_encoding
+
         v_ctx_neg, a_ctx_neg = None, None
         if config.guidance_scale != 1.0:
-            v_ctx_neg, a_ctx_neg, _ = self._text_encoder(config.negative_prompt)
+            neg_hs, neg_mask = self._text_encoder.encode(config.negative_prompt)
+            neg_out = self._embeddings_processor.process_hidden_states(neg_hs, neg_mask)
+            v_ctx_neg, a_ctx_neg = neg_out.video_encoding, neg_out.audio_encoding
 
-        # Move the base Gemma model to CPU but keep embeddings connectors on GPU
-        # as this module is also used during training
+        # Move the base Gemma model to CPU
         self._text_encoder.model.to("cpu")
-        self._text_encoder.feature_extractor_linear.to("cpu")
 
         return v_ctx_pos, a_ctx_pos, v_ctx_neg, a_ctx_neg
 

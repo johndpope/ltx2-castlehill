@@ -249,7 +249,7 @@ class LTXSCDModel(nn.Module):
                 device=video_args.x.device,
                 dtype=video_args.x.dtype,
             )
-            video_args = replace(video_args, self_attn_mask=causal_mask)
+            video_args = replace(video_args, self_attention_mask=causal_mask)
 
         # Run through encoder blocks only
         for block in self.encoder_blocks:

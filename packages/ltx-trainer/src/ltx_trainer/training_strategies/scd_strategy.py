@@ -464,6 +464,7 @@ class SCDTrainingStrategy(TrainingStrategy):
 
         video_modality = Modality(
             enabled=True,
+            sigma=sigmas.squeeze(),
             latent=noisy_video,
             timesteps=video_timesteps,
             positions=video_positions,
@@ -548,6 +549,7 @@ class SCDTrainingStrategy(TrainingStrategy):
 
         encoder_modality = Modality(
             enabled=True,
+            sigma=torch.zeros(batch_size, device=device, dtype=dtype),
             latent=video_latents,  # Clean latents x_0 for encoder (NOT noisy)
             timesteps=encoder_timesteps,  # All zeros: sigma=0 means "clean signal"
             positions=video_positions,
@@ -642,6 +644,7 @@ class SCDTrainingStrategy(TrainingStrategy):
         # (token_concat by default — SCD Paper §5.5).
         decoder_modality = Modality(
             enabled=True,
+            sigma=sigmas.squeeze(),
             latent=noisy_video,  # Noisy latents x_t for decoder (NOT clean)
             timesteps=decoder_timesteps,  # Per-token: 0 for conditioning, sigma for targets
             positions=video_positions,
@@ -782,6 +785,7 @@ class SCDTrainingStrategy(TrainingStrategy):
 
             frame_modality = Modality(
                 enabled=True,
+                sigma=sigmas.squeeze(),
                 latent=frame_noisy,
                 timesteps=frame_timesteps,
                 positions=frame_positions,
@@ -810,6 +814,7 @@ class SCDTrainingStrategy(TrainingStrategy):
             enc_timesteps = torch.zeros(batch_size, tpf, device=device, dtype=dtype)
             enc_modality = Modality(
                 enabled=True,
+                sigma=torch.zeros(batch_size, device=device, dtype=dtype),
                 latent=x0_hat,
                 timesteps=enc_timesteps,
                 positions=frame_positions,

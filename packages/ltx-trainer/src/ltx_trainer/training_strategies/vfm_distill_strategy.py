@@ -277,6 +277,7 @@ class VFMDistillStrategy(VFMv1bTrainingStrategy):
         from ltx_core.model.transformer.modality import Modality
         video_modality = Modality(
             enabled=True,
+            sigma=sigmas.squeeze(),
             latent=noisy_video,
             timesteps=video_timesteps,
             positions=video_positions,

@@ -326,6 +326,8 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
 
             sigmas_mean = per_token_sigmas[~video_conditioning_mask].mean().detach()
             sigmas_for_logging = sigmas_mean.unsqueeze(0).expand(batch_size)
+            # Per-batch sigma for Modality (used by prompt AdaLN in 2.3)
+            batch_sigmas = sigmas_mean.unsqueeze(0).expand(batch_size)
         else:
             sigmas = timestep_sampler.sample_for(video_latents)
             sigmas_expanded = sigmas.view(-1, 1, 1)
@@ -337,6 +339,7 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
             )
             per_token_sigmas = None
             sigmas_for_logging = sigmas.squeeze()
+            batch_sigmas = sigmas.squeeze()
 
         # Ensure conditioning tokens are clean
         conditioning_mask_expanded = video_conditioning_mask.unsqueeze(-1)
@@ -349,6 +352,7 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
 
         video_modality = Modality(
             enabled=True,
+            sigma=batch_sigmas,
             latent=noisy_video,
             timesteps=video_timesteps,
             positions=video_positions,
@@ -526,6 +530,7 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
 
         video_modality = Modality(
             enabled=True,
+            sigma=torch.ones(batch_size, device=device, dtype=dtype),
             latent=noisy_video,
             timesteps=video_timesteps,
             positions=video_positions,

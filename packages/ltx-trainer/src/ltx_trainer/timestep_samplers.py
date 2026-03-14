@@ -45,29 +45,61 @@ class UniformTimestepSampler(TimestepSampler):
         return self.sample(batch.shape[0], device=batch.device)
 
 
-class ShiftedLogitNormalTimestepSampler:
+class ShiftedLogitNormalTimestepSampler(TimestepSampler):
     """
-    Samples timesteps from a shifted logit-normal distribution,
+    Samples timesteps from a stretched shifted logit-normal distribution,
     where the shift is determined by the sequence length.
+    The stretching normalizes samples between percentile bounds to ensure
+    the distribution covers [0, 1] more evenly. A uniform fallback prevents
+    collapse at high token counts.
     """
 
-    def __init__(self, std: float = 1.0):
+    def __init__(self, std: float = 1.0, eps: float = 1e-3, uniform_prob: float = 0.1):
         self.std = std
+        self.eps = eps
+        self.uniform_prob = uniform_prob
+        # Percentile values for stretching (scaled by std)
+        # 99.9th percentile of standard normal ≈ 3.0902
+        # 0.5th percentile of standard normal ≈ -2.5758
+        self.normal_999_percentile = 3.0902 * std
+        self.normal_005_percentile = -2.5758 * std
 
     def sample(self, batch_size: int, seq_length: int, device: torch.device = None) -> torch.Tensor:
-        """Sample timesteps for a batch from a shifted logit-normal distribution.
+        """Sample timesteps for a batch from a stretched shifted logit-normal distribution.
         Args:
             batch_size: Number of timesteps to sample
             seq_length: Length of the sequence being processed, used to determine the shift
             device: Device to place the samples on
         Returns:
-            Tensor of shape (batch_size,) containing timesteps sampled from a shifted
-            logit-normal distribution, where the shift is determined by seq_length
+            Tensor of shape (batch_size,) containing timesteps sampled from a stretched
+            shifted logit-normal distribution, where the shift is determined by seq_length
         """
-        shift = self._get_shift_for_sequence_length(seq_length)
-        normal_samples = torch.randn((batch_size,), device=device) * self.std + shift
-        timesteps = torch.sigmoid(normal_samples)
-        return timesteps
+        mu = self._get_shift_for_sequence_length(seq_length)
+
+        # Sample from shifted logit-normal
+        normal_samples = torch.randn((batch_size,), device=device) * self.std + mu
+        logitnormal_samples = torch.sigmoid(normal_samples)
+
+        # Compute percentile bounds for stretching
+        percentile_999 = torch.sigmoid(torch.tensor(mu + self.normal_999_percentile, device=device))
+        percentile_005 = torch.sigmoid(torch.tensor(mu + self.normal_005_percentile, device=device))
+
+        # Stretch to [0, 1] range by normalizing between percentiles
+        zero_terminal_raw = (logitnormal_samples - percentile_005) / (percentile_999 - percentile_005)
+
+        # Reflect small values around eps for numerical stability
+        stretched_logit = torch.where(
+            zero_terminal_raw >= self.eps,
+            zero_terminal_raw,
+            2 * self.eps - zero_terminal_raw,
+        )
+        stretched_logit = torch.clamp(stretched_logit, 0, 1)
+
+        # Mix with uniform samples (uniform_prob of the time)
+        uniform = (1 - self.eps) * torch.rand((batch_size,), device=device) + self.eps
+        prob = torch.rand((batch_size,), device=device)
+
+        return torch.where(prob > self.uniform_prob, stretched_logit, uniform)
 
     def sample_for(self, batch: torch.Tensor) -> torch.Tensor:
         """Sample timesteps for a specific batch tensor.

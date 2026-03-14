@@ -210,6 +210,7 @@ class VideoToVideoStrategy(TrainingStrategy):
         video_modality = Modality(
             enabled=True,
             latent=combined_latents,
+            sigma=sigmas,
             timesteps=timesteps,
             positions=positions,
             context=prompt_embeds,
