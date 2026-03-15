@@ -220,7 +220,14 @@ class LtxvTrainer:
                         loss = self._training_step(batch)
                         video_pred, model_inputs = None, None
 
-                    self._accelerator.backward(loss)
+                    # In frozen mode, skip backward if loss has no grad_fn
+                    # (happens on random-path steps where no adapter was used)
+                    if loss.requires_grad:
+                        self._accelerator.backward(loss)
+                    elif self._config.model.training_mode == "frozen":
+                        logger.debug("Frozen mode: skipping backward (random path, no grad)")
+                    else:
+                        self._accelerator.backward(loss)
 
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
                         # Cast any FP8 gradients to bf16 before clipping — PyTorch's
@@ -534,6 +541,7 @@ class LtxvTrainer:
         # Use strategy to compute loss
         loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
 
+
         if return_for_logging:
             return loss, video_pred, model_inputs
         return loss
@@ -663,7 +671,7 @@ class LtxvTrainer:
         # Determine initial dtype based on training mode.
         # Note: For FSDP + LoRA, we'll cast to FP32 later in _prepare_models_for_training()
         # after the accelerator is set up, and we can detect FSDP.
-        transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
+        transformer_dtype = torch.bfloat16 if self._config.model.training_mode in ("lora", "frozen") else torch.float32
 
         self._transformer = self._transformer.to(dtype=transformer_dtype)
 
@@ -774,8 +782,10 @@ class LtxvTrainer:
                 from ltx_core.model.transformer.noise_adapter import create_noise_adapter  # noqa: PLC0415
                 self._noise_adapter = create_noise_adapter(**adapter_kwargs)
 
-            # Move adapter to same device as transformer
-            adapter_device = next(self._transformer.parameters()).device
+            # Move adapter to transformer's target device
+            # Note: transformer may still be on CPU at this point (single-GPU mode),
+            # but will be moved by accelerator.prepare(). Use configured device instead.
+            adapter_device = hw_devices.transformer
             self._noise_adapter = self._noise_adapter.to(adapter_device)
             self._training_strategy.set_noise_adapter(self._noise_adapter)
 
@@ -818,7 +828,16 @@ class LtxvTrainer:
         # Check if strategy uses stage-based training
         training_stage = self._get_training_stage()
 
-        if self._config.model.training_mode == "lora":
+        if self._config.model.training_mode == "frozen":
+            # Frozen mode: still apply LoRA wrapper (needed for quanto compatibility),
+            # but freeze ALL transformer params including LoRA. Only qφ (adapter + sigma head) trains.
+            if self._config.lora is not None:
+                self._setup_lora()
+            self._transformer.requires_grad_(False)
+            frozen_count = sum(p.numel() for p in self._transformer.parameters())
+            logger.info(f"Frozen mode: transformer fully frozen ({frozen_count:,} params), only training qφ")
+
+        elif self._config.model.training_mode == "lora":
             # For LoRA training, first set up LoRA layers
             self._setup_lora()
 
@@ -908,8 +927,10 @@ class LtxvTrainer:
                 logger.info(f"📥 Loading checkpoint from {checkpoint_path}")
                 if self._config.model.training_mode == "full":
                     self._load_full_checkpoint(checkpoint_path)
-                else:
+                elif self._config.model.training_mode == "lora":
                     self._load_lora_checkpoint(checkpoint_path)
+                else:
+                    logger.info("Frozen mode: skipping transformer checkpoint (only adapter/strategy params are trained)")
 
         # Load noise adapter checkpoint (VFM strategies)
         if self._config.model.load_noise_adapter and self._noise_adapter is not None:
@@ -1395,10 +1416,54 @@ class LtxvTrainer:
     def _save_checkpoint(self) -> Path | None:
         """Save the model weights."""
         is_lora = self._config.model.training_mode == "lora"
+        is_frozen = self._config.model.training_mode == "frozen"
         is_fsdp = self._accelerator.distributed_type == DistributedType.FSDP
 
         # Prepare paths
         save_dir = Path(self._config.output_dir) / "checkpoints"
+
+        # Determine save precision
+        save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32
+
+        # Frozen mode: only save adapter + strategy params, no transformer weights
+        if is_frozen:
+            self._accelerator.wait_for_everyone()
+            if not IS_MAIN_PROCESS:
+                return None
+
+            save_dir.mkdir(exist_ok=True, parents=True)
+            saved_weights_path = save_dir / f"strategy_step_{self._global_step:05d}.safetensors"
+
+            # Save noise adapter
+            if self._noise_adapter is not None:
+                adapter_path = save_dir / f"noise_adapter_step_{self._global_step:05d}.safetensors"
+                adapter_sd = {k: v.to(save_dtype) for k, v in self._noise_adapter.state_dict().items()}
+                save_file(adapter_sd, adapter_path)
+                logger.info(f"💾 Noise adapter for step {self._global_step} saved in {adapter_path.relative_to(self._config.output_dir)}")
+
+            # Save SigmaHead
+            if hasattr(self._training_strategy, "_sigma_head") and self._training_strategy._sigma_head is not None:
+                sigma_path = save_dir / f"sigma_head_step_{self._global_step:05d}.safetensors"
+                sigma_sd = {k: v.to(save_dtype) for k, v in self._training_strategy._sigma_head.state_dict().items()}
+                save_file(sigma_sd, sigma_path)
+                logger.info(f"💾 SigmaHead for step {self._global_step} saved in {sigma_path.relative_to(self._config.output_dir)}")
+
+            # Save strategy params
+            strategy_sd = {}
+            if hasattr(self._training_strategy, "get_strategy_state_dict"):
+                strategy_sd = self._training_strategy.get_strategy_state_dict() or {}
+            if strategy_sd:
+                save_file(
+                    {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in strategy_sd.items()},
+                    saved_weights_path,
+                )
+                logger.debug(f"Included {len(strategy_sd)} strategy params in checkpoint")
+
+            logger.info(f"💾 Frozen-mode checkpoint for step {self._global_step} saved")
+            self._checkpoint_paths.append(saved_weights_path)
+            self._cleanup_checkpoints()
+            return saved_weights_path
+
         prefix = "lora" if is_lora else "model"
         filename = f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
         saved_weights_path = save_dir / filename
@@ -1411,9 +1476,6 @@ class LtxvTrainer:
             return None
 
         save_dir.mkdir(exist_ok=True, parents=True)
-
-        # Determine save precision
-        save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32
 
         # For LoRA: extract only adapter weights; for full: use as-is
         if is_lora:

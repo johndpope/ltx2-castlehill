@@ -232,11 +232,33 @@ class NoiseAdapterV1b(nn.Module):
         self.mu_head = nn.Linear(hidden_dim, latent_dim)
         self.log_sigma_head = nn.Linear(hidden_dim, latent_dim)
 
+        # Optional per-token timestep sigma head (v1h+)
+        # Outputs a single scalar σ_timestep ∈ [sigma_min, sigma_max] per token,
+        # replacing the external SigmaHead. The adapter already has text cross-attention
+        # + position encoding + self-attention, so it knows what each token needs.
+        self.sigma_timestep_head: nn.Linear | None = None
+
         # Initialize near identity (start at N(0, I) prior)
         nn.init.zeros_(self.mu_head.weight)
         nn.init.zeros_(self.mu_head.bias)
         nn.init.zeros_(self.log_sigma_head.weight)
         nn.init.constant_(self.log_sigma_head.bias, init_sigma)
+
+    def enable_sigma_timestep_head(self, sigma_min: float = 0.3, sigma_max: float = 1.0) -> None:
+        """Add per-token timestep sigma output head (v1h).
+
+        Once enabled, forward() returns (mu, log_sigma, per_token_sigma) instead of
+        (mu, log_sigma). The sigma head shares the same transformer features —
+        no separate SigmaHead MLP needed.
+        """
+        # Get device from existing parameters
+        device = next(self.parameters()).device
+        self.sigma_timestep_head = nn.Linear(self.hidden_dim, 1).to(device)
+        self._sigma_min = sigma_min
+        self._sigma_max = sigma_max
+        # Initialize to output mid-range sigma (~0.5 after sigmoid)
+        nn.init.zeros_(self.sigma_timestep_head.weight)
+        nn.init.zeros_(self.sigma_timestep_head.bias)
 
     def forward(
         self,
@@ -244,7 +266,7 @@ class NoiseAdapterV1b(nn.Module):
         text_mask: Tensor,
         positions: Tensor,
         task_class: Tensor,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
         """Compute per-token noise distribution parameters.
 
         Args:
@@ -254,8 +276,13 @@ class NoiseAdapterV1b(nn.Module):
             task_class: [B] integer task class indices
 
         Returns:
-            mu: [B, video_seq, latent_dim] per-token mean (DIFFERENT per token)
-            log_sigma: [B, video_seq, latent_dim] per-token log std
+            If sigma_timestep_head is None (v1a-v1g behavior):
+                mu: [B, video_seq, latent_dim] per-token mean
+                log_sigma: [B, video_seq, latent_dim] per-token log std
+            If sigma_timestep_head is enabled (v1h+):
+                mu: [B, video_seq, latent_dim] per-token mean
+                log_sigma: [B, video_seq, latent_dim] per-token log std
+                per_token_sigma: [B, video_seq] timestep sigma in [sigma_min, sigma_max]
         """
         B, video_seq = positions.shape[0], positions.shape[2]
 
@@ -284,6 +311,12 @@ class NoiseAdapterV1b(nn.Module):
 
         # Clamp log_sigma to prevent collapse/explosion
         log_sigma = log_sigma.clamp(min=-1.0, max=2.0)
+
+        # 7. Optional per-token timestep sigma (v1h+)
+        if self.sigma_timestep_head is not None:
+            raw_sigma = self.sigma_timestep_head(x).squeeze(-1)  # [B, video_seq]
+            per_token_sigma = self._sigma_min + (self._sigma_max - self._sigma_min) * torch.sigmoid(raw_sigma)
+            return mu, log_sigma, per_token_sigma
 
         return mu, log_sigma
 

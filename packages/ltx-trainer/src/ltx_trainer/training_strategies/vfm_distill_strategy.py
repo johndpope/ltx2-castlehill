@@ -532,14 +532,14 @@ class VFMDistillStrategy(VFMv1bTrainingStrategy):
             # Simple PCA via SVD (center first)
             centered = all_points - all_points.mean(dim=0, keepdim=True)
             U, S, Vh = torch.linalg.svd(centered, full_matrices=False)
-            pca_2d = (centered @ Vh[:2].T).numpy()  # [N+3, 2]
+            pca_2d = (centered @ Vh[:2].T).detach().cpu().numpy()  # [N+3, 2]
 
             teacher_pca = pca_2d[:num_steps]
             gt_pca = pca_2d[num_steps]
             student_pca = pca_2d[num_steps + 1]
 
             # Variance explained
-            var_explained = (S[:2] ** 2 / (S ** 2).sum() * 100).numpy()
+            var_explained = (S[:2] ** 2 / (S ** 2).sum() * 100).detach().cpu().numpy()
 
             fig_pca = go.Figure()
 

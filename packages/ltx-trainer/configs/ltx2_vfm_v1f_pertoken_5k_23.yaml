@@ -1,14 +1,17 @@
 # =============================================================================
-# VFM v1f PER-TOKEN SIGMA — LTX-2.3 (22B) overnight run
+# VFM v1f PER-TOKEN SIGMA — LTX-2.3 (22B) overnight 5K run
 # =============================================================================
-# FIXED per-token sigma: pure adapter noise as input (no interpolation),
-# SigmaHead output used as per-token AdaLN conditioning at both train + inference.
-#
-# Run AFTER validating on overfit config (ltx2_vfm_v1f_pertoken_overfit.yaml).
+# Incorporates all fixes from overfit debugging:
+#   - SigmaHead takes x₀ + adapter_mu (not just adapter_mu)
+#   - Complexity-aware sigma targets (not global mean pull)
+#   - distill_mode: "none" (no sigma/timestep mismatch)
+#   - kl_weight: 0.1 (not 3.0 — prevents KL dominating)
+#   - kappa_max: 5.0 (not 50.0 — prevents kappa explosion)
+#   - sigma_entropy_weight: 0.1, sigma_mean_pull_weight: 0.05
 #
 # Usage:
 #   nohup uv run python scripts/train.py configs/ltx2_vfm_v1f_pertoken_5k_23.yaml \
-#     --disable-progress-bars > /tmp/vfm_v1f_pertoken_5k_23.log 2>&1 &
+#     --disable-progress-bars > /tmp/vfm_v1f_5k_overnight.log 2>&1 &
 # =============================================================================
 
 model:
@@ -17,14 +20,12 @@ model:
   training_mode: "lora"
 
 lora:
-  rank: 32
-  alpha: 32
+  rank: 4
+  alpha: 4
   dropout: 0.0
   target_modules:
-    - "to_k"
     - "to_q"
     - "to_v"
-    - "to_out.0"
 
 training_strategy:
   name: "vfm_v1f"
@@ -32,24 +33,24 @@ training_strategy:
   # === Spherical Cauchy (v1f) ===
   spherical_noise: true
   kappa_min: 0.1
-  kappa_max: 50.0
+  kappa_max: 5.0
   use_slerp_interp: false
   magnitude_reg_weight: 0.1
   target_magnitude: 1.0
   kappa_entropy_weight: 0.01
   kappa_target: 2.0
-  kappa_pull_weight: 0.05
+  kappa_pull_weight: 0.1
 
-  # === FIXED per-token sigma ===
+  # === Per-token sigma (x₀-conditioned SigmaHead) ===
   per_token_sigma: true
   sigma_min: 0.3
   sigma_max: 1.0
   sigma_head_hidden_dim: 256
-  sigma_entropy_weight: 0.01
+  sigma_entropy_weight: 0.1
   sigma_mean_target: 0.7
-  sigma_mean_pull_weight: 0.3
+  sigma_mean_pull_weight: 0.05
 
-  # === No distillation ===
+  # === No distillation — standard flow matching ===
   distill_mode: "none"
 
   # === v1b Adapter ===
@@ -63,7 +64,7 @@ training_strategy:
   tau: 1.0
   obs_noise_level: 0.2
   alpha: 0.8
-  kl_weight: 3.0
+  kl_weight: 0.1
   kl_free_bits: 0.05
   obs_loss_weight: 0.0
   adaptive_loss: false
@@ -87,7 +88,7 @@ training_strategy:
 
 optimization:
   learning_rate: 3.0e-4
-  steps: 5000
+  steps: 10000
   batch_size: 1
   gradient_accumulation_steps: 4
   max_grad_norm: 1.0
@@ -96,7 +97,7 @@ optimization:
   scheduler_params:
     eta_min: 1.0e-5
   weight_decay: 0.01
-  warmup_steps: 300
+  warmup_steps: 500
   enable_gradient_checkpointing: true
 
 acceleration:
@@ -151,7 +152,7 @@ wandb:
   enabled: true
   project: "vfm-v1f"
   entity: null
-  tags: ["vfm-v1f", "per-token-sigma-fixed", "5k-dataset", "overnight", "ltx-2.3-22b"]
+  tags: ["vfm-v1f", "per-token-sigma-x0", "complexity-targets", "5k-dataset", "overnight", "ltx-2.3-22b"]
   log_validation_videos: false
 
 seed: 42

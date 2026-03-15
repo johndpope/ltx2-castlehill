@@ -315,7 +315,7 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
         # per-token σ only as conditioning to AdaLN. No interpolation = no MSE
         # incentive to collapse σ. Both train and inference see identical inputs.
         if cfg.per_token_sigma and self._sigma_head is not None and adapter_mu is not None:
-            per_token_sigmas = self._sigma_head(adapter_mu.float())  # [B, seq]
+            per_token_sigmas = self._sigma_head(adapter_mu.float(), x0=video_latents.float())  # [B, seq]
             per_token_sigmas = per_token_sigmas * (~video_conditioning_mask).float()
 
             # FIXED: input is always pure adapter noise z — matches inference
@@ -385,6 +385,9 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
 
         # v1d metadata
         model_inputs._per_token_sigmas = per_token_sigmas
+        model_inputs._sigma_complexity_targets = self._compute_complexity_targets(
+            video_latents, cfg.sigma_min, cfg.sigma_max,
+        ) if per_token_sigmas is not None else None
         model_inputs._distill_mode = "none"
 
         # v1f spherical metadata
@@ -492,7 +495,7 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
             video_targets = video_noise - teacher_target
 
             if cfg.per_token_sigma and self._sigma_head is not None and adapter_mu is not None:
-                per_token_sigmas = self._sigma_head(adapter_mu.float())
+                per_token_sigmas = self._sigma_head(adapter_mu.float(), x0=video_latents.float())
                 per_token_sigmas = per_token_sigmas * (~video_conditioning_mask).float()
                 video_timesteps = per_token_sigmas
                 noisy_video = video_noise
@@ -563,6 +566,9 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
 
         # v1d metadata
         model_inputs._per_token_sigmas = per_token_sigmas
+        model_inputs._sigma_complexity_targets = self._compute_complexity_targets(
+            video_latents, cfg.sigma_min, cfg.sigma_max,
+        ) if per_token_sigmas is not None else None
         model_inputs._distill_mode = cfg.distill_mode
         model_inputs._distill_teacher_target = teacher_target if cfg.distill_mode == "output_match" else None
         model_inputs._distill_teacher_x0_gt = teacher_x0_gt
@@ -703,7 +709,7 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
             div_loss = self._compute_diversity_loss(adapter_mu, inputs)
             total_loss = total_loss + div_loss
 
-        # Sigma entropy + mean pull (prevent collapse to σ_min)
+        # Sigma entropy + complexity-aware pull
         per_token_sigmas = getattr(inputs, "_per_token_sigmas", None)
         loss_sigma_entropy = torch.tensor(0.0, device=video_pred.device)
         loss_sigma_pull = torch.tensor(0.0, device=video_pred.device)
@@ -712,16 +718,23 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
                 loss_sigma_entropy = self._compute_sigma_entropy_loss(per_token_sigmas, inputs)
                 total_loss = total_loss + cfg.sigma_entropy_weight * loss_sigma_entropy
 
-            # Pull mean sigma toward target (prevents σ→σ_min collapse)
+            # Per-token complexity-aware pull (replaces global mean pull)
             if cfg.sigma_mean_pull_weight > 0:
-                loss_mask = getattr(inputs, "video_loss_mask", None)
-                if loss_mask is not None:
-                    active_sigmas = per_token_sigmas[loss_mask]
+                complexity_targets = getattr(inputs, "_sigma_complexity_targets", None)
+                if complexity_targets is not None:
+                    # Per-token MSE toward complexity-derived targets
+                    loss_mask = getattr(inputs, "video_loss_mask", None)
+                    if loss_mask is not None:
+                        loss_sigma_pull = (per_token_sigmas[loss_mask] - complexity_targets[loss_mask]).pow(2).mean()
+                    else:
+                        loss_sigma_pull = (per_token_sigmas - complexity_targets).pow(2).mean()
                 else:
-                    active_sigmas = per_token_sigmas.flatten()
-                if active_sigmas.numel() > 0:
-                    loss_sigma_pull = (active_sigmas.mean() - cfg.sigma_mean_target).pow(2)
-                    total_loss = total_loss + cfg.sigma_mean_pull_weight * loss_sigma_pull
+                    # Fallback to global mean pull if no complexity targets
+                    loss_mask = getattr(inputs, "video_loss_mask", None)
+                    active_sigmas = per_token_sigmas[loss_mask] if loss_mask is not None else per_token_sigmas.flatten()
+                    if active_sigmas.numel() > 0:
+                        loss_sigma_pull = (active_sigmas.mean() - cfg.sigma_mean_target).pow(2)
+                total_loss = total_loss + cfg.sigma_mean_pull_weight * loss_sigma_pull
 
         # ════════════════════════════════════════════════
         # MAGNITUDE REGULARIZATION (v1f new)
@@ -867,7 +880,7 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
             div_loss = self._compute_diversity_loss(adapter_mu, inputs)
             total_loss = total_loss + div_loss
 
-        # L_sigma_entropy + sigma mean pull
+        # L_sigma_entropy + complexity-aware pull
         per_token_sigmas = getattr(inputs, "_per_token_sigmas", None)
         loss_sigma_entropy = torch.tensor(0.0, device=video_pred.device)
         loss_sigma_pull = torch.tensor(0.0, device=video_pred.device)
@@ -876,16 +889,21 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
                 loss_sigma_entropy = self._compute_sigma_entropy_loss(per_token_sigmas, inputs)
                 total_loss = total_loss + cfg.sigma_entropy_weight * loss_sigma_entropy
 
-            # Pull mean sigma toward target (prevents σ→σ_min collapse)
+            # Per-token complexity-aware pull (replaces global mean pull)
             if cfg.sigma_mean_pull_weight > 0:
-                loss_mask = getattr(inputs, "video_loss_mask", None)
-                if loss_mask is not None:
-                    active_sigmas = per_token_sigmas[loss_mask]
+                complexity_targets = getattr(inputs, "_sigma_complexity_targets", None)
+                if complexity_targets is not None:
+                    loss_mask = getattr(inputs, "video_loss_mask", None)
+                    if loss_mask is not None:
+                        loss_sigma_pull = (per_token_sigmas[loss_mask] - complexity_targets[loss_mask]).pow(2).mean()
+                    else:
+                        loss_sigma_pull = (per_token_sigmas - complexity_targets).pow(2).mean()
                 else:
-                    active_sigmas = per_token_sigmas.flatten()
-                if active_sigmas.numel() > 0:
-                    loss_sigma_pull = (active_sigmas.mean() - cfg.sigma_mean_target).pow(2)
-                    total_loss = total_loss + cfg.sigma_mean_pull_weight * loss_sigma_pull
+                    loss_mask = getattr(inputs, "video_loss_mask", None)
+                    active_sigmas = per_token_sigmas[loss_mask] if loss_mask is not None else per_token_sigmas.flatten()
+                    if active_sigmas.numel() > 0:
+                        loss_sigma_pull = (active_sigmas.mean() - cfg.sigma_mean_target).pow(2)
+                total_loss = total_loss + cfg.sigma_mean_pull_weight * loss_sigma_pull
 
         # L_mag: magnitude regularization (v1f)
         loss_mag = torch.tensor(0.0, device=video_pred.device)
@@ -945,11 +963,30 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
         vae_decoder: torch.nn.Module | None = None,
         prefix: str = "train",
     ) -> dict[str, Any]:
-        """Log reconstruction + spherical noise diagnostics."""
+        """Log reconstruction video + trajectory PCA + spherical diagnostics.
+
+        Logs:
+        - train/reconstruction_video: GT | Pred side-by-side video (from parent)
+        - train/trajectory_pca: PCA of adapter μ → noise z → predicted x̂₀ → GT x₀
+        - train/spherical_heatmap: κ and ||μ|| per-token heatmaps
+        """
+        # Parent logs reconstruction_video + reconstruction image
         log_dict = super().log_reconstructions_to_wandb(
             video_pred=video_pred, inputs=inputs, step=step,
             vae_decoder=vae_decoder, prefix=prefix,
         )
+
+        # Remove the static image — we only need the video
+        log_dict.pop(f"{prefix}/reconstruction", None)
+
+        # Add trajectory PCA (adapter μ → z → x̂₀ vs GT)
+        try:
+            traj_plots = self._build_adapter_trajectory_pca(
+                video_pred, inputs, step, prefix,
+            )
+            log_dict.update(traj_plots)
+        except Exception as e:
+            logger.warning(f"Failed to build trajectory PCA: {e}")
 
         # Add spherical-specific plots
         kappa = getattr(inputs, "_spherical_kappa", None)
@@ -964,6 +1001,115 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
                 logger.warning(f"Failed to build spherical plots: {e}")
 
         return log_dict
+
+    @staticmethod
+    def _build_adapter_trajectory_pca(
+        video_pred: Tensor,
+        inputs: ModelInputs,
+        step: int,
+        prefix: str = "train",
+    ) -> dict[str, Any]:
+        """PCA plot showing adapter's noise generation path in latent space.
+
+        Plots 4 key points:
+        - adapter μ: the adapter's mean output (what it "wants" to generate)
+        - noise z: the actual sampled noise (μ + stochastic perturbation)
+        - predicted x̂₀: what the transformer reconstructs from z (z - v_pred)
+        - GT x₀: the ground truth clean video
+
+        When training works, the trajectory should show:
+        z → x̂₀ converging toward GT, and μ stabilizing.
+        """
+        try:
+            import wandb
+            import plotly.graph_objects as go
+
+            adapter_mu = getattr(inputs, "_vfm_adapter_mu", None)
+            use_adapter = getattr(inputs, "_vfm_use_adapter", False)
+            raw_latents = getattr(inputs, "_raw_video_latents", None)
+
+            if not use_adapter or adapter_mu is None or raw_latents is None:
+                return {}
+
+            noise = inputs.shared_noise[0].float().cpu()       # [seq, C]
+            mu = adapter_mu[0].float().cpu()                    # [seq, C]
+            pred_v = video_pred[0].float().cpu()                # [seq, C]
+            pred_x0 = noise - pred_v                            # x̂₀ = z - v
+            gt_x0 = raw_latents[0].float().cpu()                # [C, F, H, W]
+
+            # Flatten GT to [seq, C]
+            c, f, h, w = gt_x0.shape
+            gt_x0_flat = gt_x0.permute(1, 2, 3, 0).reshape(-1, c)  # [F*H*W, C]
+
+            # Average over tokens → [C] per point
+            points = torch.stack([
+                mu.mean(dim=0),
+                noise.mean(dim=0),
+                pred_x0.mean(dim=0),
+                gt_x0_flat.mean(dim=0),
+            ])  # [4, C]
+
+            # PCA via SVD
+            centered = points - points.mean(dim=0, keepdim=True)
+            U, S, Vh = torch.linalg.svd(centered, full_matrices=False)
+            pca = (centered @ Vh[:2].T).detach().cpu().numpy()  # [4, 2]
+            var_explained = (S[:2] ** 2 / (S ** 2).sum() * 100).detach().cpu().numpy()
+
+            # Distances
+            d_z_to_gt = (noise.mean(0) - gt_x0_flat.mean(0)).pow(2).mean().sqrt().item()
+            d_pred_to_gt = (pred_x0.mean(0) - gt_x0_flat.mean(0)).pow(2).mean().sqrt().item()
+            d_mu_to_gt = (mu.mean(0) - gt_x0_flat.mean(0)).pow(2).mean().sqrt().item()
+
+            fig = go.Figure()
+
+            # Path: μ → z → x̂₀
+            fig.add_trace(go.Scatter(
+                x=pca[:3, 0], y=pca[:3, 1],
+                mode="lines+markers+text",
+                name="Adapter path",
+                text=["μ (adapter mean)", "z (sampled noise)", "x̂₀ (predicted)"],
+                textposition=["top center", "top center", "bottom center"],
+                textfont=dict(size=10),
+                line=dict(color="#FF5722", width=3),
+                marker=dict(size=[12, 10, 14], symbol=["circle", "circle", "star"],
+                            color=["#FF9800", "#FF5722", "#E91E63"]),
+            ))
+
+            # GT point
+            fig.add_trace(go.Scatter(
+                x=[pca[3, 0]], y=[pca[3, 1]],
+                mode="markers+text",
+                name="GT x₀",
+                text=["GT x₀"],
+                textposition="bottom center",
+                marker=dict(size=16, symbol="diamond", color="#4CAF50"),
+            ))
+
+            # Dashed line: x̂₀ → GT (the gap we're trying to close)
+            fig.add_trace(go.Scatter(
+                x=[pca[2, 0], pca[3, 0]], y=[pca[2, 1], pca[3, 1]],
+                mode="lines",
+                name=f"Gap (L2={d_pred_to_gt:.3f})",
+                line=dict(color="#4CAF50", width=2, dash="dot"),
+                showlegend=True,
+            ))
+
+            fig.update_layout(
+                title=(
+                    f"Adapter Trajectory PCA — step {step}<br>"
+                    f"<sub>d(z,GT)={d_z_to_gt:.3f}  d(x̂₀,GT)={d_pred_to_gt:.3f}  "
+                    f"d(μ,GT)={d_mu_to_gt:.3f}</sub>"
+                ),
+                xaxis_title=f"PC1 ({var_explained[0]:.1f}%)",
+                yaxis_title=f"PC2 ({var_explained[1]:.1f}%)",
+                template="plotly_dark",
+                legend=dict(x=0.02, y=0.98),
+                height=500, width=700,
+            )
+            return {f"{prefix}/trajectory_pca": wandb.Plotly(fig)}
+        except Exception as e:
+            logger.debug(f"Adapter trajectory PCA failed: {e}")
+            return {}
 
     @staticmethod
     def _build_spherical_plots(
@@ -1006,7 +1152,7 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
             for f_idx in range(num_frames):
                 fig.add_trace(
                     go.Heatmap(
-                        z=kappa_frames[f_idx].numpy(),
+                        z=kappa_frames[f_idx].detach().cpu().numpy(),
                         colorscale="Viridis",
                         showscale=(f_idx == num_frames - 1),
                         colorbar=dict(title="κ", y=0.75),
@@ -1015,7 +1161,7 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
                 )
                 fig.add_trace(
                     go.Heatmap(
-                        z=norm_frames[f_idx].numpy(),
+                        z=norm_frames[f_idx].detach().cpu().numpy(),
                         colorscale="Plasma",
                         showscale=(f_idx == num_frames - 1),
                         colorbar=dict(title="||μ||", y=0.25),
