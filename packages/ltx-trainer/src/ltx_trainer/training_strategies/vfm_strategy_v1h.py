@@ -248,8 +248,11 @@ class VFMv1hTrainingStrategy(VFMv1fTrainingStrategy):
             per_token_sigmas = per_token_sigmas * (~video_conditioning_mask).float()
 
             # Interpolate with per-token sigma: x_t[i] = (1-σ_i)·x₀[i] + σ_i·z[i]
-            sigmas_expanded = per_token_sigmas.unsqueeze(-1)  # [B, seq, 1]
-            noisy_video = (1 - sigmas_expanded) * video_latents + sigmas_expanded * video_noise
+            # CRITICAL: detach sigma from interpolation gradient — otherwise σ→σ_min
+            # because lower σ = less noise = easier MSE. Sigma gets its gradient only
+            # from the complexity-target pull loss and entropy loss.
+            sigmas_for_interp = per_token_sigmas.detach().unsqueeze(-1)  # [B, seq, 1]
+            noisy_video = (1 - sigmas_for_interp) * video_latents + sigmas_for_interp * video_noise
 
             video_targets = video_noise - video_latents
             video_timesteps = per_token_sigmas
