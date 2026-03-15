@@ -143,18 +143,14 @@ class VFMv1hTrainingStrategy(VFMv1fTrainingStrategy):
         """Prepare inputs with adapter-integrated per-token sigma."""
         cfg = self.config
         latents = batch["latents"]
-        video_latents = latents["latents"]
-        num_frames = latents["num_frames"]
-        height = latents["height"]
-        width = latents["width"]
+        video_latents = latents["latents"]  # [B, C, F, H, W]
+        num_frames = video_latents.shape[2]
+        height = video_latents.shape[3]
+        width = video_latents.shape[4]
 
-        # Convert batched tensors to scalars
-        if isinstance(num_frames, Tensor):
-            num_frames = num_frames[0].item()
-        if isinstance(height, Tensor):
-            height = height[0].item()
-        if isinstance(width, Tensor):
-            width = width[0].item()
+        # Patchify: [B, C, F, H, W] → [B, seq_len, C]
+        video_latents = self._video_patchifier.patchify(video_latents)
+
         fps = latents.get("fps", None)
         if fps is not None and not torch.all(fps == fps[0]):
             logger.warning(f"Different FPS values in batch: {fps.tolist()}")
@@ -290,16 +286,14 @@ class VFMv1hTrainingStrategy(VFMv1fTrainingStrategy):
             timesteps=video_timesteps,
             positions=video_positions,
             context=video_prompt_embeds,
-            context_mask=None,
+            context_mask=prompt_attention_mask,
         )
-
-        audio_modality = Modality(enabled=False)
 
         video_loss_mask = ~video_conditioning_mask
 
         model_inputs = ModelInputs(
             video=video_modality,
-            audio=audio_modality,
+            audio=None,
             video_targets=video_targets,
             audio_targets=None,
             video_loss_mask=video_loss_mask,
