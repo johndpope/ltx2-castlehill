@@ -18,6 +18,7 @@ from ltx_trainer.training_strategies.vfm_distill_strategy import VFMDistillConfi
 from ltx_trainer.training_strategies.vfm_strategy_v1d import VFMv1dTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1e import VFMv1eTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1f import VFMv1fTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v1_1f import VFMv11fTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1g import VFMv1gTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1h import VFMv1hTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v2a import VFMv2aTrainingConfig
@@ -121,6 +122,7 @@ TrainingStrategyConfig = Annotated[
     | Annotated[VFMv2aTrainingConfig, Tag("vfm_v2a")]
     | Annotated[VFMv1hTrainingConfig, Tag("vfm_v1h")]
     | Annotated[VFMv1gTrainingConfig, Tag("vfm_v1g")]
+    | Annotated[VFMv11fTrainingConfig, Tag("vfm_v1_1f")]
     | Annotated[VFMv1fTrainingConfig, Tag("vfm_v1f")]
     | Annotated[VFMv1eTrainingConfig, Tag("vfm_v1e")]
     | Annotated[VFMv1dTrainingConfig, Tag("vfm_v1d")]

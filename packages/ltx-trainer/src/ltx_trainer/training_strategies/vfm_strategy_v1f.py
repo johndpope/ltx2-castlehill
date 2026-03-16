@@ -126,6 +126,26 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
 
     config: VFMv1fTrainingConfig
 
+    def _apply_sigma_correction(
+        self,
+        per_token_sigmas: Tensor,
+        video_latents: Tensor,
+        loss_mask: Tensor,
+    ) -> Tensor:
+        """Hook for subclasses to apply sigma corrections after SigmaHead.
+
+        Default: identity (no correction). Override in v1.1f for SigmaBiasNet.
+
+        Args:
+            per_token_sigmas: [B, seq] from SigmaHead (already masked)
+            video_latents: [B, seq, D] clean patchified latents
+            loss_mask: [B, seq] bool mask of active tokens
+
+        Returns:
+            Corrected per_token_sigmas [B, seq]
+        """
+        return per_token_sigmas
+
     def _sample_spherical_noise(
         self,
         mu: Tensor,
@@ -317,6 +337,11 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
         if cfg.per_token_sigma and self._sigma_head is not None and adapter_mu is not None:
             per_token_sigmas = self._sigma_head(adapter_mu.float(), x0=video_latents.float())  # [B, seq]
             per_token_sigmas = per_token_sigmas * (~video_conditioning_mask).float()
+
+            # Hook for subclasses (e.g. v1.1f sigma bias correction)
+            per_token_sigmas = self._apply_sigma_correction(
+                per_token_sigmas, video_latents, ~video_conditioning_mask
+            )
 
             # FIXED: input is always pure adapter noise z — matches inference
             noisy_video = video_noise
