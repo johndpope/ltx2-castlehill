@@ -116,6 +116,26 @@ class VFMv1fTrainingConfig(VFMv1dTrainingConfig):
         "Must be strong enough to overcome the MSE incentive to minimize sigma.",
     )
 
+    # === Anti-collapse: mu→x₀ alignment ===
+    mu_align_weight: float = Field(
+        default=0.0, ge=0.0,
+        description="Weight for direct mu→x₀ alignment loss. "
+        "Forces adapter mu_hat to point toward normalize(x₀), creating a short gradient "
+        "path that bypasses DiT. Prevents adapter collapse. 0.0 = disabled.",
+    )
+    mu_align_warmup_steps: int = Field(
+        default=0, ge=0,
+        description="Warmup steps for mu alignment loss (linearly ramp from 0).",
+    )
+
+    # === Anti-collapse: freeze DiT ===
+    freeze_dit_steps: int = Field(
+        default=0, ge=0,
+        description="Freeze DiT LoRA weights for first N steps, forcing all learning "
+        "through the adapter's z output. Prevents DiT from 'cheating' by learning to "
+        "denoise generic noise. 0 = no freezing.",
+    )
+
 
 class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
     """VFM v1f — Spherical Cauchy noise for VFM adapter.
@@ -741,6 +761,35 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
 
             total_loss = total_loss + cfg.obs_loss_weight * loss_obs
 
+        # ── MU→X₀ ALIGNMENT LOSS (anti-collapse) ──
+        # Forces adapter mu_hat to point toward normalize(x₀).
+        # Short gradient path: loss → mu_hat → adapter params.
+        # Bypasses DiT entirely — the adapter MUST encode text to minimize this.
+        loss_mu_align = torch.tensor(0.0, device=video_pred.device)
+        if use_adapter and adapter_mu is not None and cfg.mu_align_weight > 0:
+            video_latents = inputs._vfm_video_latents  # [B, seq, C]
+            mu_hat_align = normalize(adapter_mu)  # [B, seq, 128]
+            x0_hat_align = normalize(video_latents)  # [B, seq, 128]
+
+            # Cosine similarity: 1 = perfect alignment, -1 = opposite
+            cos_sim = (mu_hat_align * x0_hat_align).sum(dim=-1)  # [B, seq]
+
+            # Loss = 1 - cos_sim (range [0, 2])
+            align_loss = 1.0 - cos_sim
+
+            if inputs.video_loss_mask is not None:
+                mask = inputs.video_loss_mask.float()
+                loss_mu_align = (align_loss * mask).sum() / mask.sum().clamp(min=1)
+            else:
+                loss_mu_align = align_loss.mean()
+
+            # Optional warmup
+            if cfg.mu_align_warmup_steps > 0 and self._current_step < cfg.mu_align_warmup_steps:
+                warmup = self._current_step / cfg.mu_align_warmup_steps
+                loss_mu_align = loss_mu_align * warmup
+
+            total_loss = total_loss + cfg.mu_align_weight * loss_mu_align
+
         # Diversity loss (inherited from v1c)
         if use_adapter and adapter_mu is not None:
             div_loss = self._compute_diversity_loss(adapter_mu, inputs)
@@ -804,6 +853,7 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
             "vfm/loss_mf": loss_mf.item(),
             "vfm/loss_kl": loss_kl.item(),
             "vfm/loss_obs": loss_obs.item(),
+            "vfm/loss_mu_align": loss_mu_align.item(),
             "vfm/loss_total": total_loss.item(),
             "vfm/use_adapter": float(use_adapter),
         }
@@ -813,6 +863,31 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
             self._last_vfm_metrics["vfm/adapter_sigma_mean"] = torch.exp(
                 inputs._vfm_adapter_log_sigma
             ).mean().item()
+
+            # ── COLLAPSE DETECTION ──
+            # Track running mean of adapter mu across steps (Welford's online algorithm).
+            # If mu barely changes between different prompts → adapter collapsed.
+            mu_fingerprint = adapter_mu[0].detach().mean(dim=0)  # [C] mean over tokens
+            if not hasattr(self, "_mu_running_mean"):
+                self._mu_running_mean = mu_fingerprint.clone()
+                self._mu_running_var = torch.zeros_like(mu_fingerprint)
+                self._mu_step_count = 0
+            self._mu_step_count += 1
+            delta = mu_fingerprint - self._mu_running_mean
+            self._mu_running_mean = self._mu_running_mean + delta / self._mu_step_count
+            self._mu_running_var = self._mu_running_var + delta * (mu_fingerprint - self._mu_running_mean)
+
+            if self._mu_step_count > 10:
+                var = (self._mu_running_var / (self._mu_step_count - 1)).mean().item()
+                deviation = delta.pow(2).mean().item()
+                self._last_vfm_metrics["vfm/collapse_mu_var"] = var
+                self._last_vfm_metrics["vfm/collapse_mu_deviation"] = deviation
+                if self._mu_step_count > 100 and var < 1e-6:
+                    logger.warning(
+                        f"ADAPTER COLLAPSE DETECTED at step {self._current_step}! "
+                        f"Inter-sample mu variance = {var:.2e} (should be >> 1e-6). "
+                        f"Adapter is ignoring text input."
+                    )
 
         if mu_hat is not None and kappa is not None:
             self._last_vfm_metrics.update({

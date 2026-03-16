@@ -113,6 +113,16 @@ class LtxvTrainer:
         self._collect_trainable_params()
         self._load_checkpoint()
         self._prepare_models_for_training()
+
+        # Pass transformer to strategy for multi-pass forward (ILR in v1.2f)
+        # Done after setup_accelerator + prepare so the model is on GPU and tracked
+        if hasattr(self._training_strategy, "set_transformer"):
+            self._training_strategy.set_transformer(
+                self._transformer,
+                grad_accumulation_steps=self._config.optimization.gradient_accumulation_steps,
+            )
+            logger.info("Passed transformer to training strategy for multi-pass forward")
+
         self._dataset = None
         self._global_step = -1
         self._checkpoint_paths = []
@@ -193,6 +203,27 @@ class LtxvTrainer:
                     batch = next(data_iter)
 
                 step_start_time = time.time()
+
+                # Anti-collapse: freeze/unfreeze DiT LoRA at configured step boundary
+                freeze_dit_steps = getattr(
+                    getattr(self._training_strategy, "config", None),
+                    "freeze_dit_steps", 0,
+                )
+                if freeze_dit_steps > 0 and self._global_step == 0:
+                    # Freeze DiT LoRA at start
+                    for name, p in self._transformer.named_parameters():
+                        if p.requires_grad and "noise_adapter" not in name.lower():
+                            p.requires_grad = False
+                            p._was_frozen_for_adapter = True
+                    logger.info(f"Froze DiT LoRA for first {freeze_dit_steps} steps (adapter-only training)")
+                elif freeze_dit_steps > 0 and self._global_step == freeze_dit_steps:
+                    # Unfreeze
+                    for p in self._transformer.parameters():
+                        if hasattr(p, "_was_frozen_for_adapter"):
+                            p.requires_grad = True
+                            del p._was_frozen_for_adapter
+                    logger.info(f"Unfroze DiT LoRA at step {freeze_dit_steps}")
+
                 with self._accelerator.accumulate(self._transformer):
                     is_optimization_step = (step + 1) % cfg.optimization.gradient_accumulation_steps == 0
                     if is_optimization_step:
@@ -1207,8 +1238,31 @@ class LtxvTrainer:
 
         lr = opt_cfg.learning_rate
         wd = opt_cfg.weight_decay
+        adapter_lr = opt_cfg.adapter_learning_rate
+
+        # Split param groups if adapter has separate LR
+        if adapter_lr is not None and self._noise_adapter is not None:
+            adapter_param_ids = {id(p) for p in self._noise_adapter.parameters()}
+            # Also include sigma_head if present
+            if hasattr(self._training_strategy, "_sigma_head") and self._training_strategy._sigma_head is not None:
+                adapter_param_ids.update(id(p) for p in self._training_strategy._sigma_head.parameters())
+
+            dit_params = [p for p in self._trainable_params if id(p) not in adapter_param_ids]
+            adp_params = [p for p in self._trainable_params if id(p) in adapter_param_ids]
+
+            param_groups = [
+                {"params": dit_params, "lr": lr, "weight_decay": wd},
+                {"params": adp_params, "lr": adapter_lr, "weight_decay": wd},
+            ]
+            logger.info(
+                f"Separate LRs: DiT/LoRA ({len(dit_params)} params) @ {lr}, "
+                f"Adapter+SigmaHead ({len(adp_params)} params) @ {adapter_lr}"
+            )
+        else:
+            param_groups = self._trainable_params
+
         if opt_cfg.optimizer_type == "adamw":
-            optimizer = AdamW(self._trainable_params, lr=lr, weight_decay=wd)
+            optimizer = AdamW(param_groups, lr=lr, weight_decay=wd)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415

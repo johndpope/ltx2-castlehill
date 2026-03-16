@@ -19,6 +19,7 @@ from ltx_trainer.training_strategies.vfm_strategy_v1d import VFMv1dTrainingConfi
 from ltx_trainer.training_strategies.vfm_strategy_v1e import VFMv1eTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1f import VFMv1fTrainingConfig
 # from ltx_trainer.training_strategies.vfm_strategy_v1_1f import VFMv11fTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v1_2f import VFMv12fTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1g import VFMv1gTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1h import VFMv1hTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v2a import VFMv2aTrainingConfig
@@ -137,6 +138,7 @@ TrainingStrategyConfig = Annotated[
     | Annotated[VFMv1hTrainingConfig, Tag("vfm_v1h")]
     | Annotated[VFMv1gTrainingConfig, Tag("vfm_v1g")]
     | Annotated[VFMv1fTrainingConfig, Tag("vfm_v1f")]
+    | Annotated[VFMv12fTrainingConfig, Tag("vfm_v1_2f")]
     | Annotated[VFMv1eTrainingConfig, Tag("vfm_v1e")]
     | Annotated[VFMv1dTrainingConfig, Tag("vfm_v1d")]
     | Annotated[VFMv1cTrainingConfig, Tag("vfm_v1c")]
@@ -151,7 +153,14 @@ class OptimizationConfig(ConfigBaseModel):
 
     learning_rate: float = Field(
         default=5e-4,
-        description="Learning rate for optimization",
+        description="Learning rate for optimization (DiT/LoRA params)",
+    )
+
+    adapter_learning_rate: float | None = Field(
+        default=None,
+        description="Separate learning rate for VFM noise adapter. "
+        "If None, uses the main learning_rate. Higher LR (e.g. 1e-3) helps "
+        "the adapter escape collapse basins faster than the DiT LoRA.",
     )
 
     steps: int = Field(

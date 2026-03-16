@@ -33,9 +33,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="VFM v1f Microbenchmark")
     parser.add_argument("--model-path", type=str,
-                        default="/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors")
+                        default="/media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors")
     parser.add_argument("--lora-path", type=str, required=True)
     parser.add_argument("--adapter-path", type=str, required=True)
+    parser.add_argument("--sigma-head-path", type=str, default=None,
+                        help="Path to SigmaHead checkpoint. If provided, uses per-token sigma "
+                        "for timestep conditioning (matches training). Auto-detected from adapter path.")
 
     parser.add_argument("--data-root", type=str,
                         default="/media/12TB/ddit_ditto_data")
@@ -133,12 +136,10 @@ def load_models(args):
 
     # Adapter
     latent_channels = 128
-    # Read a sample embedding to get text_embed_dim
-    sample_emb = torch.load(
-        os.path.join(args.data_root, "conditions_final", "000000.pt"),
-        map_location="cpu", weights_only=True,
-    )
-    text_embed_dim = sample_emb["video_prompt_embeds"].shape[-1]
+    # Infer text_embed_dim from adapter checkpoint (more reliable than data)
+    adapter_state = load_file(args.adapter_path)
+    text_embed_dim = adapter_state["text_proj.weight"].shape[1]
+    print(f"  Adapter text_embed_dim: {text_embed_dim}")
 
     from ltx_core.model.transformer.noise_adapter_v1b import TASK_CLASSES, create_noise_adapter_v1b
     noise_adapter = create_noise_adapter_v1b(
@@ -146,7 +147,6 @@ def load_models(args):
         hidden_dim=args.adapter_hidden_dim, num_heads=args.adapter_num_heads,
         num_layers=args.adapter_num_layers, pos_dim=args.adapter_pos_dim,
     )
-    adapter_state = load_file(args.adapter_path)
     noise_adapter.load_state_dict(adapter_state)
     noise_adapter = noise_adapter.to(device=device)
     noise_adapter.eval()
@@ -154,16 +154,79 @@ def load_models(args):
     task_idx = TASK_CLASSES.get("i2v", 0)
     task_class = torch.tensor([task_idx], device=device)
 
+    # Load caption projection shim if needed (LTX-2.3: cached embeds are 3840-dim,
+    # but adapter expects 4096-dim after caption projection)
+    caption_proj = None
+    if text_embed_dim != 3840:
+        # Check if cached embeddings need projection
+        sample_emb = torch.load(
+            os.path.join(args.data_root, "conditions_final", "000000.pt"),
+            map_location="cpu", weights_only=True,
+        )
+        cached_dim = sample_emb["video_prompt_embeds"].shape[-1]
+        if cached_dim != text_embed_dim:
+            print(f"  Loading caption projection shim ({cached_dim} -> {text_embed_dim})...")
+            from safetensors import safe_open
+            from ltx_core.model.transformer.text_projection import PixArtAlphaTextProjection
+            caption_proj = PixArtAlphaTextProjection(in_features=cached_dim, hidden_size=text_embed_dim)
+            # Load from LTX-2 checkpoint
+            ltx2_path = "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+            source_path = ltx2_path if os.path.exists(ltx2_path) else args.model_path
+            with safe_open(source_path, framework="pt") as f:
+                prefix = "model.diffusion_model.caption_projection."
+                for key in f.keys():
+                    if key.startswith(prefix):
+                        param_name = key[len(prefix):]
+                        param = f.get_tensor(key)
+                        parts = param_name.split(".")
+                        obj = caption_proj
+                        for part in parts[:-1]:
+                            obj = getattr(obj, part)
+                        setattr(obj, parts[-1], torch.nn.Parameter(param))
+            caption_proj = caption_proj.to(device).eval()
+            for p in caption_proj.parameters():
+                p.requires_grad = False
+            print(f"  Caption projection shim loaded")
+
+    # SigmaHead (per-token timestep conditioning — critical for matching training)
+    sigma_head = None
+    sigma_head_path = args.sigma_head_path
+    if sigma_head_path is None:
+        # Auto-detect from adapter path
+        adapter_dir = Path(args.adapter_path).parent
+        adapter_step = Path(args.adapter_path).stem.split("_")[-1]
+        auto_path = adapter_dir / f"sigma_head_step_{adapter_step}.safetensors"
+        if auto_path.exists():
+            sigma_head_path = str(auto_path)
+
+    if sigma_head_path and os.path.exists(sigma_head_path):
+        print(f"  Loading SigmaHead from {Path(sigma_head_path).name}...")
+        from ltx_trainer.training_strategies.vfm_strategy_v1d import SigmaHead
+        sigma_head_state = load_file(sigma_head_path)
+        # Infer dimensions from checkpoint
+        hidden_dim = sigma_head_state["net.0.weight"].shape[0]
+        input_dim = sigma_head_state["net.0.weight"].shape[1]
+        # SigmaHead takes (adapter_mu, x0) → input_dim = latent_dim + latent_dim = 256
+        # or just latent_dim if x0 not used
+        latent_dim = latent_channels  # 128
+        sigma_head = SigmaHead(latent_dim=latent_dim, hidden_dim=hidden_dim)
+        sigma_head.load_state_dict(sigma_head_state)
+        sigma_head = sigma_head.to(device=device).eval()
+        print(f"  SigmaHead loaded (hidden={hidden_dim})")
+    else:
+        print("  No SigmaHead found — using timesteps=1.0 (may not match training!)")
+
     mem_gb = torch.cuda.memory_allocated(device) / 1e9
     print(f"  Model load: {t_model:.1f}s | GPU: {mem_gb:.1f} GB")
     print(f"  LoRA rank: {lora_rank} | Adapter: {sum(p.numel() for p in noise_adapter.parameters()) / 1e6:.1f}M params")
 
-    return transformer, noise_adapter, task_class
+    return transformer, noise_adapter, task_class, caption_proj, sigma_head
 
 
 def generate_latent(
     args, transformer, noise_adapter, task_class,
     prompt_embeds, prompt_mask, seed,
+    sigma_head=None,
 ):
     """Generate video latent from a single prompt embedding."""
     device = torch.device(args.device)
@@ -227,9 +290,21 @@ def generate_latent(
         # Transformer forward (flow map)
         t0 = time.time()
         if args.num_steps == 1:
-            timesteps = torch.ones(1, total_tokens, device=device, dtype=dtype)
+            # Per-token sigma from SigmaHead (matches training conditioning)
+            if sigma_head is not None:
+                # SigmaHead expects (mu, x0). At inference x0 is unknown,
+                # so we pass None (falls back to zero-padding internally)
+                per_token_sigmas = sigma_head(mu.float(), x0=None)  # [1, total_tokens]
+                timesteps = per_token_sigmas.to(dtype)
+                sigma_val = per_token_sigmas.mean(dim=1).to(dtype)  # batch sigma
+                timings["sigma_mean"] = per_token_sigmas.mean().item()
+                timings["sigma_std"] = per_token_sigmas.std().item()
+            else:
+                timesteps = torch.ones(1, total_tokens, device=device, dtype=dtype)
+                sigma_val = torch.ones(1, device=device, dtype=dtype)
+
             video_mod = Modality(
-                enabled=True, latent=z, timesteps=timesteps,
+                enabled=True, sigma=sigma_val, latent=z, timesteps=timesteps,
                 positions=positions, context=prompt_embeds, context_mask=prompt_mask,
             )
             v_pred, _ = transformer(video=video_mod, audio=None, perturbations=None)
@@ -242,8 +317,9 @@ def generate_latent(
                 t_km1 = time_steps[k + 1]
                 dt = t_km1 - t_k
                 timesteps = torch.full((1, total_tokens), t_k.item(), device=device, dtype=dtype)
+                sigma_val = torch.full((1,), t_k.item(), device=device, dtype=dtype)
                 video_mod = Modality(
-                    enabled=True, latent=x, timesteps=timesteps,
+                    enabled=True, sigma=sigma_val, latent=x, timesteps=timesteps,
                     positions=positions, context=prompt_embeds, context_mask=prompt_mask,
                 )
                 v_pred, _ = transformer(video=video_mod, audio=None, perturbations=None)
@@ -340,7 +416,7 @@ def main():
 
     # Load models
     print()
-    transformer, noise_adapter, task_class = load_models(args)
+    transformer, noise_adapter, task_class, caption_proj, sigma_head = load_models(args)
 
     # Phase 1: Generate all latents (transformer on GPU)
     print(f"\n{'─' * 90}")
@@ -350,8 +426,22 @@ def main():
     latent_results = []
     for s in samples:
         emb = torch.load(s["embedding_path"], map_location="cpu", weights_only=True)
-        prompt_embeds = emb["video_prompt_embeds"].unsqueeze(0).to(torch.bfloat16).to(args.device)
+        video_features = emb["video_prompt_embeds"].unsqueeze(0).to(torch.bfloat16).to(args.device)
+        audio_features = emb.get("audio_prompt_embeds")
+        if audio_features is not None:
+            audio_features = audio_features.unsqueeze(0).to(torch.bfloat16).to(args.device)
         prompt_mask = emb["prompt_attention_mask"].unsqueeze(0).to(args.device)
+
+        # Apply caption projection shim if needed (3840 -> 4096)
+        if caption_proj is not None:
+            with torch.inference_mode():
+                video_features = caption_proj(video_features)
+                if audio_features is not None:
+                    audio_features = caption_proj(audio_features)
+
+        # Note: cached embeddings are already post-connector (from preprocessing).
+        # Only the caption projection shim is needed (applied above).
+        prompt_embeds = video_features
 
         for seed in args.seeds:
             fname = f"v1f_{s['id']:05d}_seed{seed}_{args.num_steps}step.mp4"
@@ -365,6 +455,7 @@ def main():
             x_latent, timings = generate_latent(
                 args, transformer, noise_adapter, task_class,
                 prompt_embeds, prompt_mask, seed,
+                sigma_head=sigma_head,
             )
 
             diag = ""
@@ -394,7 +485,7 @@ def main():
     print("Phase 2: VAE decode + save mp4 (freeing transformer VRAM)")
     print(f"{'─' * 90}")
 
-    del transformer, noise_adapter
+    del transformer, noise_adapter, caption_proj
     gc.collect()
     torch.cuda.empty_cache()
 
