@@ -1,13 +1,16 @@
 # =============================================================================
-# VFM v1f PER-TOKEN SIGMA — LTX-2.3 (22B) overnight 5K run
+# VFM v1f — ALIGNED TO PAPER (arXiv:2603.07276) — 5K overnight
 # =============================================================================
-# Incorporates all fixes from overfit debugging:
-#   - SigmaHead takes x₀ + adapter_mu (not just adapter_mu)
-#   - Complexity-aware sigma targets (not global mean pull)
-#   - distill_mode: "none" (no sigma/timestep mismatch)
-#   - kl_weight: 0.1 (not 3.0 — prevents KL dominating)
-#   - kappa_max: 5.0 (not 50.0 — prevents kappa explosion)
-#   - sigma_entropy_weight: 0.1, sigma_mean_pull_weight: 0.05
+# Paper Eq.19: L = (1/2τ²)·L_MF + (1/2σ²)·L_obs + L_KL
+#
+# Key alignment changes:
+#   - obs_loss_weight: 25.0 (= 1/(2σ²) with σ=0.2 → 1/0.08 = 12.5, doubled for safety)
+#     Paper says L_obs is CRITICAL — provides conditioning signal to adapter
+#   - adaptive_loss: true (Algorithm 2 line 15: w = 1/stopgrad(‖L‖ + γ)^p)
+#   - tau: 1.0 → L_MF weight = 1/(2τ²) = 0.5 (paper uses τ=1-100)
+#   - kl_weight: 0.001 (paper: L_KL, no explicit weight mentioned)
+#   - alpha: 0.8 (paper Algorithm 2: unconditional mixing for flow map quality)
+#   - ema_decay: 0.999 (paper: EMA of θ for L_obs stability)
 #
 # Usage:
 #   nohup uv run python scripts/train.py configs/ltx2_vfm_v1f_pertoken_5k_23.yaml \
@@ -60,16 +63,17 @@ training_strategy:
   adapter_num_layers: 4
   adapter_pos_dim: 256
 
-  # === VFM Loss ===
-  tau: 1.0
-  obs_noise_level: 0.2
-  alpha: 0.8
-  kl_weight: 0.001
+  # === VFM Loss (Paper Eq.19) ===
+  # L = (1/2τ²)·L_MF + (1/2σ²)·L_obs + L_KL
+  tau: 1.0                       # τ: data misfit tolerance (paper ablates 1-100)
+  obs_noise_level: 0.2           # σ for observation noise y = A(x) + ε
+  alpha: 0.8                     # Prob of using adapter noise (1-α = unconditional N(0,I))
+  kl_weight: 0.001               # L_KL weight (spherical KL has constant floor ~14.8)
   kl_free_bits: 0.05
-  obs_loss_weight: 0.0
-  adaptive_loss: false
-  ema_decay: 0.999
-  first_frame_conditioning_p: 0.1
+  obs_loss_weight: 12.5          # = 1/(2σ²) with σ=0.2 → 1/(2·0.04) = 12.5 (Paper Eq.19)
+  adaptive_loss: true            # Paper Algorithm 2: w = 1/stopgrad(‖L‖ + γ)^p
+  ema_decay: 0.999               # Paper: θ⁻ = EMA(θ) for L_obs stability
+  first_frame_conditioning_p: 0.5 # i2v conditioning — higher than before for more obs signal
 
   # === Diversity ===
   diversity_weight: 0.1
@@ -152,7 +156,7 @@ wandb:
   enabled: true
   project: "vfm-v1f"
   entity: null
-  tags: ["vfm-v1f", "per-token-sigma-x0", "complexity-targets", "5k-dataset", "overnight", "ltx-2.3-22b"]
+  tags: ["vfm-v1f", "paper-aligned", "L_obs-enabled", "adaptive-loss", "5k-dataset", "overnight", "ltx-2.3-22b"]
   log_validation_videos: false
 
 seed: 42

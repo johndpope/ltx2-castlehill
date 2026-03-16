@@ -606,6 +606,79 @@ class LtxvTrainer:
         logger.debug("Validation prompt embeddings cached. Gemma model unloaded")
         return cached_embeddings
 
+    def _swap_attention_modules(self, model: "LTXModel") -> None:
+        """Swap standard attention with Clifford attention in transformer blocks.
+
+        Copies shared weights (Q/K/V projections, norms, gating, output) from the
+        original Attention modules into new CliffordRollingAttention or
+        CliffordVideoAttention modules. Only new parameters (score_mix) are
+        randomly initialized.
+        """
+        from ltx_core.model.transformer.clifford_attention import (  # noqa: PLC0415
+            CliffordRollingAttention,
+            CliffordVideoAttention,
+        )
+        from ltx_core.model.transformer.attention import Attention  # noqa: PLC0415
+
+        attn_type = self._config.model.self_attn_type
+        ck = self._config.model.clifford_kwargs or {}
+        swapped = 0
+
+        for block in model.transformer_blocks:
+            old_attn = block.attn1
+            if not isinstance(old_attn, Attention):
+                continue
+
+            if attn_type == "clifford_video":
+                new_attn = CliffordVideoAttention(
+                    query_dim=old_attn.to_q.in_features,
+                    heads=old_attn.heads,
+                    dim_head=old_attn.dim_head,
+                    norm_eps=1e-6,
+                    rope_type=old_attn.rope_type,
+                    attention_function=old_attn.attention_function,
+                    apply_gated_attention=old_attn.to_gate_logits is not None,
+                    num_spatial_shifts=ck.get("num_spatial_shifts", 12),
+                    num_temporal_shifts=ck.get("num_temporal_shifts", 4),
+                    num_channel_shifts=ck.get("num_channel_shifts", 4),
+                    max_spatial_len=ck.get("max_spatial_len", 2048),
+                    spherical_norm=ck.get("spherical_norm", False),
+                    num_frames=ck.get("num_frames", 1),
+                )
+            elif attn_type == "clifford_rolling":
+                new_attn = CliffordRollingAttention(
+                    query_dim=old_attn.to_q.in_features,
+                    heads=old_attn.heads,
+                    dim_head=old_attn.dim_head,
+                    norm_eps=1e-6,
+                    rope_type=old_attn.rope_type,
+                    attention_function=old_attn.attention_function,
+                    apply_gated_attention=old_attn.to_gate_logits is not None,
+                    num_seq_shifts=ck.get("num_seq_shifts", 16),
+                    num_channel_shifts=ck.get("num_channel_shifts", 4),
+                    max_seq_len=ck.get("max_seq_len", 2048),
+                )
+            else:
+                continue
+
+            # Copy shared weights
+            new_attn.to_q = old_attn.to_q
+            new_attn.to_k = old_attn.to_k
+            new_attn.to_v = old_attn.to_v
+            new_attn.to_out = old_attn.to_out
+            new_attn.q_norm = old_attn.q_norm
+            new_attn.k_norm = old_attn.k_norm
+            if old_attn.to_gate_logits is not None:
+                new_attn.to_gate_logits = old_attn.to_gate_logits
+
+            block.attn1 = new_attn
+            swapped += 1
+
+        logger.info(
+            f"Swapped {swapped} self-attention blocks to {attn_type} "
+            f"(kwargs: {ck})"
+        )
+
     def _load_models(self) -> None:
         """Load the LTX-2 model components."""
         # Load audio components if:
@@ -638,6 +711,10 @@ class LtxvTrainer:
             with_vocoder=load_audio,
             with_text_encoder=False,  # Text encoder handled separately
         )
+
+        # Apply Clifford attention swap if configured
+        if self._config.model.self_attn_type != "standard":
+            self._swap_attention_modules(components.transformer)
 
         # Extract components and move to configured devices (supports multi-GPU)
         # Note: hw_devices was already set above for transformer loading

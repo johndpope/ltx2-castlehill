@@ -714,26 +714,25 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
 
             total_loss = total_loss + cfg.kl_weight * loss_kl
 
-        # Observation loss (inherited from v1a)
+        # Observation loss: L_obs = ‖x₀ - f_θ(z)‖² (Paper Eq.14)
+        # For video: compare full predicted clean video against GT clean video.
+        # Paper uses forward operator A for image inverse problems (inpainting etc).
+        # For text-to-video, the "observation" is the full video — text describes all of it.
+        # So L_obs = ‖x₀ - (z - v_pred)‖² = reconstruction quality on clean latents.
         loss_obs = torch.tensor(0.0, device=video_pred.device)
-        if (
-            use_adapter
-            and cfg.obs_loss_weight > 0
-            and getattr(inputs, "_vfm_observation", None) is not None
-        ):
-            obs = inputs._vfm_observation
-            # Apply forward operator to prediction: x̂₀ = z - v
+        if use_adapter and cfg.obs_loss_weight > 0:
             video_noise = inputs._vfm_video_noise
-            pred_x0 = video_noise - video_pred
-            noise_level = inputs._vfm_noise_level
+            video_latents = inputs._vfm_video_latents
+            pred_x0 = video_noise - video_pred  # f_θ(z) = z - v
 
+            noise_level = getattr(inputs, "_vfm_noise_level", 0.0)
             if isinstance(noise_level, (int, float)) and noise_level > 0:
                 obs_noise = torch.randn_like(pred_x0) * noise_level
                 pred_obs = pred_x0 + obs_noise
             else:
                 pred_obs = pred_x0
 
-            obs_diff = (pred_obs - obs).pow(2)
+            obs_diff = (pred_obs - video_latents).pow(2)
             if inputs.video_loss_mask is not None:
                 mask = inputs.video_loss_mask.unsqueeze(-1).float()
                 loss_obs = (obs_diff * mask).sum() / mask.sum().clamp(min=1) / obs_diff.shape[-1]
