@@ -293,10 +293,12 @@ def main():
         if args.num_steps == 1:
             # One-step: full transformer forward at t=1
             timesteps = torch.ones(1, total_tokens, device=device, dtype=dtype)
+            sigma = torch.ones(1, device=device, dtype=dtype)  # σ=1.0 for 1-step (pure noise)
 
             video_mod = Modality(
                 enabled=True,
                 latent=z,
+                sigma=sigma,
                 timesteps=timesteps,
                 positions=positions,
                 context=prompt_embeds,
@@ -320,10 +322,12 @@ def main():
                 timesteps = torch.full(
                     (1, total_tokens), t_k.item(), device=device, dtype=dtype,
                 )
+                sigma = torch.full((1,), t_k.item(), device=device, dtype=dtype)
 
                 video_mod = Modality(
                     enabled=True,
                     latent=x,
+                    sigma=sigma,
                     timesteps=timesteps,
                     positions=positions,
                     context=prompt_embeds,
