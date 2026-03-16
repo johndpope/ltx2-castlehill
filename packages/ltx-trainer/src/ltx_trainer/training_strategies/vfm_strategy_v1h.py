@@ -204,12 +204,16 @@ class VFMv1hTrainingStrategy(VFMv1fTrainingStrategy):
                 task_class=ip_sample.task_class,
             )
 
-            # v1h: adapter returns 3 outputs (mu, log_sigma, per_token_sigma)
+            # v1h: adapter may return 3 outputs (mu, log_sigma, per_token_sigma)
+            # but we IGNORE the predicted sigma and use complexity targets instead.
+            # Why: the sigma head can't learn text→complexity mapping fast enough,
+            # and when trained end-to-end it collapses. Complexity targets from x₀
+            # give spatially-varying sigma by construction.
             if len(result) == 3:
-                mu, log_sigma, per_token_sigmas = result
+                mu, log_sigma, _predicted_sigma = result
             else:
                 mu, log_sigma = result
-                per_token_sigmas = None
+            per_token_sigmas = None  # will be set from complexity targets below
 
             if cfg.spherical_noise:
                 video_noise, mu_hat, kappa, mu_norm = self._sample_spherical_noise(mu, log_sigma)
@@ -241,18 +245,21 @@ class VFMv1hTrainingStrategy(VFMv1fTrainingStrategy):
             per_token_sigmas = None
 
         # ════════════════════════════════════════════════
-        # PER-TOKEN SIGMA INTERPOLATION (from adapter output)
+        # PER-TOKEN SIGMA FROM COMPLEXITY TARGETS
         # ════════════════════════════════════════════════
-        if per_token_sigmas is not None:
+        # Compute sigma directly from x₀ content complexity — no learning needed.
+        # High-gradient regions (edges, motion) get high sigma, flat regions get low sigma.
+        if use_adapter_noise and cfg.per_token_sigma:
+            per_token_sigmas = self._compute_complexity_targets(
+                video_latents, cfg.sigma_min, cfg.sigma_max,
+            )
+
             # Zero out sigma for conditioning tokens (first frame)
             per_token_sigmas = per_token_sigmas * (~video_conditioning_mask).float()
 
             # Interpolate with per-token sigma: x_t[i] = (1-σ_i)·x₀[i] + σ_i·z[i]
-            # CRITICAL: detach sigma from interpolation gradient — otherwise σ→σ_min
-            # because lower σ = less noise = easier MSE. Sigma gets its gradient only
-            # from the complexity-target pull loss and entropy loss.
-            sigmas_for_interp = per_token_sigmas.detach().unsqueeze(-1)  # [B, seq, 1]
-            noisy_video = (1 - sigmas_for_interp) * video_latents + sigmas_for_interp * video_noise
+            sigmas_expanded = per_token_sigmas.unsqueeze(-1)  # [B, seq, 1]
+            noisy_video = (1 - sigmas_expanded) * video_latents + sigmas_expanded * video_noise
 
             video_targets = video_noise - video_latents
             video_timesteps = per_token_sigmas

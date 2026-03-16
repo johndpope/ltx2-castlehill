@@ -64,7 +64,7 @@ training_strategy:
   tau: 1.0
   obs_noise_level: 0.2
   alpha: 0.8
-  kl_weight: 0.1
+  kl_weight: 0.001
   kl_free_bits: 0.05
   obs_loss_weight: 0.0
   adaptive_loss: false

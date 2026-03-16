@@ -20,6 +20,8 @@ from ltx_trainer.training_strategies.vfm_strategy_v1e import VFMv1eTrainingConfi
 from ltx_trainer.training_strategies.vfm_strategy_v1f import VFMv1fTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1g import VFMv1gTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1h import VFMv1hTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v2a import VFMv2aTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v2b import VFMv2bTrainingConfig
 
 
 class ConfigBaseModel(BaseModel):
@@ -115,6 +117,8 @@ TrainingStrategyConfig = Annotated[
     | Annotated[VFMSCDTrainingConfig, Tag("vfm_scd")]
     | Annotated[VFMTrainingConfig, Tag("vfm")]
     | Annotated[VFMv1bTrainingConfig, Tag("vfm_v1b")]
+    | Annotated[VFMv2bTrainingConfig, Tag("vfm_v2b")]
+    | Annotated[VFMv2aTrainingConfig, Tag("vfm_v2a")]
     | Annotated[VFMv1hTrainingConfig, Tag("vfm_v1h")]
     | Annotated[VFMv1gTrainingConfig, Tag("vfm_v1g")]
     | Annotated[VFMv1fTrainingConfig, Tag("vfm_v1f")]

@@ -331,7 +331,20 @@ class VFMv1fTrainingStrategy(VFMv1dTrainingStrategy):
         else:
             sigmas = timestep_sampler.sample_for(video_latents)
             sigmas_expanded = sigmas.view(-1, 1, 1)
-            noisy_video = (1 - sigmas_expanded) * video_latents + sigmas_expanded * video_noise
+
+            if cfg.use_slerp_interp:
+                # Geodesic interpolation: SLERP on direction, lerp on magnitude
+                # Produces inputs on the hypersphere manifold instead of cutting
+                # through it linearly. Target stays v = z - x₀ for simple reconstruction.
+                x0_dir = normalize(video_latents)
+                z_dir = normalize(video_noise)
+                x0_mag = video_latents.norm(dim=-1, keepdim=True)
+                z_mag = video_noise.norm(dim=-1, keepdim=True)
+                interp_dir = slerp(x0_dir, z_dir, sigmas_expanded)
+                interp_mag = (1 - sigmas_expanded) * x0_mag + sigmas_expanded * z_mag
+                noisy_video = interp_dir * interp_mag
+            else:
+                noisy_video = (1 - sigmas_expanded) * video_latents + sigmas_expanded * video_noise
 
             video_targets = video_noise - video_latents
             video_timesteps = self._create_per_token_timesteps(
