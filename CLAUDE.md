@@ -31,12 +31,15 @@ When working on this project, **eagerly anticipate** the user's goals and sugges
 - ❌ **Content-adaptive routing** (v1e): Added complexity but not validated before stacking.
 - ❌ **v1g HyperSphereDiff losses**: Over-engineered — too many loss terms fighting each other.
 
+### Architecture Iterations — In Progress
+- ✅ **v3a DMD2 Adversarial Distribution Matching** (active): GAN discriminator in noisy latent space (DMD2/FlashMotion) + Flow Distribution Matching with SpatialHead (DiagDistill). LoRA rank 32. Discriminator: 18M-param latent transformer with register tokens. SpatialHead: 178K-param separable conv with confidence prediction. No teacher ODE needed at training time — uses GT x₀ as real distribution. Precomputed 8-step trajectories available at `trajectories/` dir. W&B project: `vfm-v3a`.
+- ✅ **CliffordVideoAttention** (tested): Geometric sparse attention with rolling spatial/temporal/channel shifts. 48 blocks swapped post-load. Trains on standard text-to-video. Tested on 3090 (hp-z6).
+
 ### Architecture Iterations — Next (ordered by expected impact)
+- **v3a + Audio**: Add audio branch to v3a with OmniForcing's Audio Sink Tokens + Identity RoPE stabilizer. Discriminator already supports text conditioning — extend to audio conditioning.
+- **v3b Joint Self-Forcing**: OmniForcing Eq. 9 — train with model's own autoregressive outputs as KV context (fixes exposure bias for SCD streaming).
+- **Diagonal Denoising** (DiagDistill): Progressive step reduction for SCD chunks (5→4→3→2→2 steps). Maps directly to SCD encoder-decoder architecture.
 - **v2b Multi-Resolution Speculative Training** (SSD #3): Same noise z at K sigma levels [1.0, 0.7, 0.5, 0.3] in ONE batched DiT pass. K× training signal for <2× cost. Consistency loss across ODE paths. See [docs/SSD.md](docs/SSD.md).
-- **Velocity Speculation Cache** (SSD #2): Cache (noise_fingerprint → DiT_velocity). Skip 40-60% of DiT calls in late training when adapter converges.
-- **Concentration-Scheduled Trajectories**: Use κ as ODE parameter instead of σ. Denoising = concentration-sharpening on S^127. Per-token κ-velocity for adaptive multi-step.
-- **Consistency distillation (rCM)**: NVIDIA's approach scales to 10B+ video models. 2-4 step generation with high quality.
-- **Adversarial post-training**: Add discriminator loss after initial VFM training for sharper outputs (DAPT approach).
 - **Async Adapter-DiT Pipeline** (SSD #5): CUDA streams to hide adapter latency. ~4% free speedup.
 
 ### Hard-Won Lessons (DO NOT repeat these mistakes)
@@ -47,6 +50,9 @@ When working on this project, **eagerly anticipate** the user's goals and sugges
 5. **Override minimally**: When adding to a strategy, override the smallest possible method. v2a broke reconstructions by overriding `_prepare_standard_inputs` — fixed by overriding only `_sample_spherical_noise`.
 6. **Sigma collapse directions**: With interpolation, learned σ collapses to σ_min (easier MSE). Detaching σ from MSE causes swing to σ_max. Use complexity targets from x₀ as the gradient source.
 7. **Evaluate before scaling**: Always overfit 10 samples first. Check loss_mf decreasing AND reconstruction_video sharpness in W&B before launching 5K runs.
+8. **No separate fake score network for DMD**: DMD1's approach (19B fake scorer) is impractical. DMD2/FlashMotion use a lightweight discriminator (~18M) in noisy latent space — same quality, 1000x fewer params.
+9. **Precomputed trajectories are reusable**: The `trajectories/` dir (8-step ODE states) contains teacher outputs. Don't recompute — `states[-1]` = teacher denoised output, `x0_gt` = ground truth.
+10. **GT x₀ IS the real distribution**: For discriminator training, use ground truth x₀ as "real" — no teacher ODE needed. Teacher ODE output ≠ data distribution (it's the teacher's approximation).
 
 ### Training Strategy Checklist
 Before scaling any experiment:

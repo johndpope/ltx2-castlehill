@@ -1355,7 +1355,7 @@ class LtxvTrainer:
         self._optimizer, self._lr_scheduler = self._accelerator.prepare(optimizer, lr_scheduler)
 
         # DMD-VFM v3a: create discriminator optimizer
-        if self._fake_score_net is not None:
+        if getattr(self, "_fake_score_net", None) is not None:
             from ltx_trainer.training_strategies.vfm_strategy_v3a import DMDVFMv3aTrainingStrategy  # noqa: PLC0415
             if isinstance(self._training_strategy, DMDVFMv3aTrainingStrategy):
                 disc_lr = self._training_strategy.config.disc_lr
@@ -1648,7 +1648,7 @@ class LtxvTrainer:
                 logger.info(f"💾 SigmaHead for step {self._global_step} saved in {sigma_path.relative_to(self._config.output_dir)}")
 
             # Save FakeScoreNetwork (DMD-VFM v3a)
-            if self._fake_score_net is not None:
+            if getattr(self, "_fake_score_net", None) is not None:
                 score_path = save_dir / f"fake_score_step_{self._global_step:05d}.safetensors"
                 score_sd = {k: v.to(save_dtype) for k, v in self._fake_score_net.state_dict().items()}
                 save_file(score_sd, score_path)

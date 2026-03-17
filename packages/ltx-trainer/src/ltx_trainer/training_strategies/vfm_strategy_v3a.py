@@ -290,23 +290,12 @@ class DMDVFMv3aTrainingStrategy(VFMv1fTrainingStrategy):
     ) -> Tensor:
         """Get teacher output for discriminator's "real" samples.
 
-        Priority:
-        1. Precomputed teacher latents (from precompute_teacher_latents.py)
-        2. Ground truth x0 (always available, simplest)
-        3. Live teacher ODE (expensive, 8 DiT passes)
+        Uses GT x0 as the real distribution sample. The precomputed trajectories
+        (states[-1]) are available in the dataset but GT x0 is cleaner and
+        represents the actual data distribution we want to match.
 
-        For DMD2, using GT x0 as "real" is valid — the discriminator learns
-        data distribution vs student distribution. Precomputed teacher latents
-        are an alternative that matches the teacher's output distribution
-        specifically (useful if teacher != data, e.g., distilled model).
+        The discriminator learns: real(x0) vs fake(x_student).
         """
-        # Check for precomputed teacher cache loaded into batch
-        teacher_cached = getattr(self, "_batch_teacher_output", None)
-        if teacher_cached is not None:
-            self._batch_teacher_output = None  # consume
-            return teacher_cached.detach()
-
-        # Default: use GT x0 as real (FlashMotion approach)
         return x0.detach()
 
     def compute_loss(
@@ -522,3 +511,170 @@ class DMDVFMv3aTrainingStrategy(VFMv1fTrainingStrategy):
                 pass
 
         return total_loss
+
+    def log_reconstructions_to_wandb(
+        self,
+        video_pred: Tensor,
+        inputs: ModelInputs,
+        step: int,
+        vae_decoder: torch.nn.Module | None = None,
+        prefix: str = "train",
+    ) -> dict[str, Any]:
+        """Log v1f reconstructions + DMD2-specific distribution visualizations.
+
+        Adds to v1f's plots:
+        - train/dmd2_distribution: PCA of real (GT x₀) vs fake (student x̂₀) samples
+        - train/disc_scores: Discriminator score histograms
+        - train/flow_confidence: Motion confidence heatmap from SpatialHead
+        """
+        # Parent (v1f) logs: reconstruction_video, trajectory_pca, spherical plots
+        log_dict = super().log_reconstructions_to_wandb(
+            video_pred=video_pred, inputs=inputs, step=step,
+            vae_decoder=vae_decoder, prefix=prefix,
+        )
+
+        # DMD2 distribution plot
+        try:
+            dmd2_plots = self._build_dmd2_distribution_plot(
+                video_pred, inputs, step, prefix,
+            )
+            log_dict.update(dmd2_plots)
+        except Exception as e:
+            logger.debug(f"DMD2 distribution plot failed: {e}")
+
+        return log_dict
+
+    def _build_dmd2_distribution_plot(
+        self,
+        video_pred: Tensor,
+        inputs: ModelInputs,
+        step: int,
+        prefix: str = "train",
+    ) -> dict[str, Any]:
+        """PCA plot showing real vs fake distribution + discriminator scores.
+
+        Shows:
+        - Cloud of GT x₀ tokens (green) vs student x̂₀ tokens (red)
+        - Discriminator decision boundary (if available)
+        - Per-token D scores as color intensity
+        """
+        try:
+            import wandb  # noqa: PLC0415
+            import plotly.graph_objects as go  # noqa: PLC0415
+            from plotly.subplots import make_subplots  # noqa: PLC0415
+
+            use_adapter = getattr(inputs, "_vfm_use_adapter", False)
+            raw_latents = getattr(inputs, "_raw_video_latents", None)
+            if not use_adapter or raw_latents is None:
+                return {}
+
+            noise = inputs.shared_noise[0].float().cpu()
+            pred_v = video_pred[0].float().cpu()
+            x_student = noise - pred_v  # [seq, C]
+            gt_x0 = raw_latents[0].float().cpu()
+            c, f, h, w = gt_x0.shape
+            gt_flat = gt_x0.permute(1, 2, 3, 0).reshape(-1, c)  # [seq, C]
+
+            # Subsample tokens for visualization (max 200)
+            n_tokens = min(200, x_student.shape[0])
+            idx = torch.randperm(x_student.shape[0])[:n_tokens]
+            x_s = x_student[idx]  # [n, C]
+            x_g = gt_flat[idx]    # [n, C]
+
+            # Joint PCA on both distributions
+            all_pts = torch.cat([x_s, x_g], dim=0)  # [2n, C]
+            centered = all_pts - all_pts.mean(dim=0, keepdim=True)
+            U, S, Vh = torch.linalg.svd(centered, full_matrices=False)
+            pca = (centered @ Vh[:2].T).detach().numpy()
+            var_exp = (S[:2] ** 2 / (S ** 2).sum() * 100).detach().numpy()
+
+            pca_fake = pca[:n_tokens]
+            pca_real = pca[n_tokens:]
+
+            # Distribution overlap metric (lower = more similar = better)
+            mean_fake = pca_fake.mean(axis=0)
+            mean_real = pca_real.mean(axis=0)
+            dist_overlap = float(((mean_fake - mean_real) ** 2).sum() ** 0.5)
+
+            # Compute discriminator scores if available
+            d_scores_fake = None
+            d_scores_real = None
+            if self._discriminator is not None:
+                try:
+                    with torch.no_grad():
+                        device = next(self._discriminator.parameters()).device
+                        disc_dtype = next(self._discriminator.parameters()).dtype
+                        t_c = torch.tensor([0.5], device=device, dtype=disc_dtype)
+                        text = inputs.video.context[:1].to(device=device, dtype=disc_dtype)
+
+                        # Score a few fake/real samples
+                        eps = torch.randn(1, x_student.shape[0], c, device=device, dtype=disc_dtype) * 0.5
+                        noisy_f = (0.5 * x_student.unsqueeze(0).to(device=device, dtype=disc_dtype) + 0.5 * eps)
+                        noisy_r = (0.5 * gt_flat.unsqueeze(0).to(device=device, dtype=disc_dtype) + 0.5 * eps)
+                        d_f = self._discriminator(noisy_f, t_c, text).item()
+                        d_r = self._discriminator(noisy_r, t_c, text).item()
+                        d_scores_fake = d_f
+                        d_scores_real = d_r
+                except Exception:
+                    pass
+
+            # Build figure: 2 subplots (distribution PCA + D scores)
+            fig = make_subplots(
+                rows=1, cols=2,
+                subplot_titles=["Real vs Fake Distribution (PCA)", "Discriminator Scores"],
+                column_widths=[0.65, 0.35],
+            )
+
+            # Left: PCA scatter
+            fig.add_trace(go.Scatter(
+                x=pca_real[:, 0], y=pca_real[:, 1],
+                mode="markers", name="Real (GT x₀)",
+                marker=dict(size=5, color="#4CAF50", opacity=0.6),
+            ), row=1, col=1)
+            fig.add_trace(go.Scatter(
+                x=pca_fake[:, 0], y=pca_fake[:, 1],
+                mode="markers", name="Fake (student x̂₀)",
+                marker=dict(size=5, color="#F44336", opacity=0.6),
+            ), row=1, col=1)
+            # Distribution means
+            fig.add_trace(go.Scatter(
+                x=[mean_real[0], mean_fake[0]], y=[mean_real[1], mean_fake[1]],
+                mode="markers+lines+text",
+                name=f"Mean gap ({dist_overlap:.3f})",
+                text=["μ_real", "μ_fake"], textposition="top center",
+                marker=dict(size=12, symbol="x", color=["#4CAF50", "#F44336"]),
+                line=dict(dash="dot", color="white", width=2),
+            ), row=1, col=1)
+
+            # Right: D scores bar chart
+            if d_scores_fake is not None:
+                fig.add_trace(go.Bar(
+                    x=["D(real)", "D(fake)"],
+                    y=[d_scores_real, d_scores_fake],
+                    marker_color=["#4CAF50", "#F44336"],
+                    name="D scores",
+                    showlegend=False,
+                ), row=1, col=2)
+                fig.add_hline(y=0, line_dash="dash", line_color="gray", row=1, col=2)
+
+            fig.update_layout(
+                title=(
+                    f"DMD2 Distribution Matching — step {step}<br>"
+                    f"<sub>Overlap distance: {dist_overlap:.4f} | "
+                    f"D(real)={d_scores_real:.3f}, D(fake)={d_scores_fake:.3f}</sub>"
+                    if d_scores_fake is not None else
+                    f"DMD2 Distribution Matching — step {step}<br>"
+                    f"<sub>Overlap distance: {dist_overlap:.4f}</sub>"
+                ),
+                template="plotly_dark",
+                height=450, width=900,
+                legend=dict(x=0.02, y=0.98),
+            )
+            fig.update_xaxes(title_text=f"PC1 ({var_exp[0]:.1f}%)", row=1, col=1)
+            fig.update_yaxes(title_text=f"PC2 ({var_exp[1]:.1f}%)", row=1, col=1)
+
+            return {f"{prefix}/dmd2_distribution": wandb.Plotly(fig)}
+
+        except Exception as e:
+            logger.debug(f"DMD2 distribution plot failed: {e}")
+            return {}

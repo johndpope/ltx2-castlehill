@@ -359,26 +359,23 @@ class TextToVideoStrategy(TrainingStrategy):
         try:
             decoder_device = next(vae_decoder.parameters()).device
             decoder_dtype = next(vae_decoder.parameters()).dtype
-            with torch.inference_mode():
-                gt_decoded = vae_decoder(
-                    raw_latents[sample_idx:sample_idx + 1].to(device=decoder_device, dtype=decoder_dtype)
-                )
-                pred_decoded = vae_decoder(
-                    pred_spatial[sample_idx:sample_idx + 1].to(device=decoder_device, dtype=decoder_dtype)
-                )
-                noisy_decoded = vae_decoder(
-                    noisy_spatial[sample_idx:sample_idx + 1].to(device=decoder_device, dtype=decoder_dtype)
-                )
 
-            # [-1, 1] -> [0, 1]
-            gt_decoded = gt_decoded.float().clamp(-1, 1) * 0.5 + 0.5
-            pred_decoded = pred_decoded.float().clamp(-1, 1) * 0.5 + 0.5
-            noisy_decoded = noisy_decoded.float().clamp(-1, 1) * 0.5 + 0.5
+            # Decode one at a time, moving results to CPU immediately to save VRAM
+            def _decode_one(latent: Tensor) -> Tensor:
+                with torch.inference_mode():
+                    decoded = vae_decoder(latent.to(device=decoder_device, dtype=decoder_dtype))
+                result = decoded.float().clamp(-1, 1) * 0.5 + 0.5
+                return result[0].cpu()  # [3, T, H, W]
 
-            # [1, 3, T, H, W] -> [3, T, H, W]
-            gt_frames = gt_decoded[0].cpu()
-            pred_frames = pred_decoded[0].cpu()
-            noisy_frames = noisy_decoded[0].cpu()
+            # Free training activations before VAE decode
+            torch.cuda.empty_cache()
+
+            gt_frames = _decode_one(raw_latents[sample_idx:sample_idx + 1])
+            torch.cuda.empty_cache()
+            pred_frames = _decode_one(pred_spatial[sample_idx:sample_idx + 1])
+            torch.cuda.empty_cache()
+            noisy_frames = _decode_one(noisy_spatial[sample_idx:sample_idx + 1])
+            torch.cuda.empty_cache()
 
             # Mid-frame triplet image: source | predict | target
             mid_f = gt_frames.shape[1] // 2
