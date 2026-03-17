@@ -24,6 +24,7 @@ from ltx_trainer.training_strategies.vfm_strategy_v1g import VFMv1gTrainingConfi
 from ltx_trainer.training_strategies.vfm_strategy_v1h import VFMv1hTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v2a import VFMv2aTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v2b import VFMv2bTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v3a import DMDVFMv3aTrainingConfig
 
 
 class ConfigBaseModel(BaseModel):
@@ -133,6 +134,7 @@ TrainingStrategyConfig = Annotated[
     | Annotated[VFMSCDTrainingConfig, Tag("vfm_scd")]
     | Annotated[VFMTrainingConfig, Tag("vfm")]
     | Annotated[VFMv1bTrainingConfig, Tag("vfm_v1b")]
+    | Annotated[DMDVFMv3aTrainingConfig, Tag("vfm_v3a")]
     | Annotated[VFMv2bTrainingConfig, Tag("vfm_v2b")]
     | Annotated[VFMv2aTrainingConfig, Tag("vfm_v2a")]
     | Annotated[VFMv1hTrainingConfig, Tag("vfm_v1h")]
@@ -221,6 +223,13 @@ class OptimizationConfig(ConfigBaseModel):
     enable_gradient_checkpointing: bool = Field(
         default=False,
         description="Enable gradient checkpointing to save memory at the cost of slower training",
+    )
+
+    score_mix_lr_multiplier: float = Field(
+        default=1.0,
+        description="LR multiplier for Clifford score_mix parameters. "
+        "Higher values (e.g., 3.0) help geometric mixing adapt faster.",
+        ge=1.0,
     )
 
 

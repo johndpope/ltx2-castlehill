@@ -317,6 +317,8 @@ class LtxvTrainer:
 
                     # Update progress and log metrics
                     current_lr = self._optimizer.param_groups[0]["lr"]
+                    if len(self._optimizer.param_groups) > 1:
+                        adapter_lr = self._optimizer.param_groups[1]["lr"]
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
 
                     progress.update_training(
@@ -331,6 +333,7 @@ class LtxvTrainer:
                         metrics = {
                             "train/loss": loss.item(),
                             "train/learning_rate": current_lr,
+                        **({"train/adapter_lr": adapter_lr} if len(self._optimizer.param_groups) > 1 else {}),
                             "train/step_time": step_time,
                             "train/global_step": self._global_step,
                         }
@@ -901,6 +904,22 @@ class LtxvTrainer:
             if isinstance(self._training_strategy, (VFMTrainingStrategy, VFMv1bTrainingStrategy)):
                 self._training_strategy.set_transformer_ref(self._transformer)
 
+            # DMD-VFM v3a: create discriminator and pass to strategy
+            self._fake_score_net = None  # reused field name for discriminator
+            from ltx_trainer.training_strategies.vfm_strategy_v3a import DMDVFMv3aTrainingStrategy  # noqa: PLC0415
+            if isinstance(self._training_strategy, DMDVFMv3aTrainingStrategy):
+                from ltx_core.model.transformer.latent_discriminator import LatentDiscriminator  # noqa: PLC0415
+                disc_params = self._training_strategy.get_discriminator_params()
+                self._fake_score_net = LatentDiscriminator(**disc_params)
+                self._fake_score_net = self._fake_score_net.to(device=adapter_device, dtype=torch.bfloat16)
+                self._training_strategy.set_fake_score_network(self._fake_score_net)
+                self._training_strategy.set_transformer(
+                    self._transformer,
+                    grad_accumulation_steps=self._config.optimization.gradient_accumulation_steps,
+                )
+                disc_n = sum(p.numel() for p in self._fake_score_net.parameters())
+                logger.info(f"DMD-VFM v3a: LatentDiscriminator created ({disc_n:,} params)")
+
             adapter_params = sum(p.numel() for p in self._noise_adapter.parameters())
             logger.info(
                 f"VFM noise adapter: "
@@ -1079,9 +1098,11 @@ class LtxvTrainer:
         if strategy_dict and hasattr(self._training_strategy, "load_strategy_state_dict"):
             loaded, skipped = self._training_strategy.load_strategy_state_dict(strategy_dict)
             if loaded:
-                logger.info(f"✅ Loaded {len(loaded)} strategy params from checkpoint")
+                n_loaded = loaded if isinstance(loaded, int) else len(loaded)
+                logger.info(f"✅ Loaded {n_loaded} strategy params from checkpoint")
             if skipped:
-                logger.warning(f"⚠️ Skipped {len(skipped)} strategy params (modules not initialised)")
+                n_skipped = skipped if isinstance(skipped, int) else len(skipped)
+                logger.warning(f"⚠️ Skipped {n_skipped} strategy params (modules not initialised)")
 
     def _prepare_models_for_training(self) -> None:
         """Prepare models for training with Accelerate."""
@@ -1261,6 +1282,41 @@ class LtxvTrainer:
         else:
             param_groups = self._trainable_params
 
+        # Apply score_mix LR multiplier for Clifford attention params
+        if opt_cfg.score_mix_lr_multiplier > 1.0:
+            score_mix_ids = set()
+            for name, param in self._transformer.named_parameters():
+                if "score_mix" in name and param.requires_grad:
+                    score_mix_ids.add(id(param))
+
+            if score_mix_ids:
+                if isinstance(param_groups, list) and isinstance(param_groups[0], dict):
+                    # Already using param groups — split score_mix from the first group
+                    new_groups = []
+                    for group in param_groups:
+                        regular = [p for p in group["params"] if id(p) not in score_mix_ids]
+                        sm_params = [p for p in group["params"] if id(p) in score_mix_ids]
+                        if regular:
+                            new_groups.append({**group, "params": regular})
+                        if sm_params:
+                            new_groups.append({
+                                **group, "params": sm_params,
+                                "lr": group.get("lr", lr) * opt_cfg.score_mix_lr_multiplier,
+                            })
+                    param_groups = new_groups
+                else:
+                    # Simple list of params — split into two groups
+                    regular = [p for p in param_groups if id(p) not in score_mix_ids]
+                    sm_params = [p for p in param_groups if id(p) in score_mix_ids]
+                    param_groups = [
+                        {"params": regular, "lr": lr, "weight_decay": wd},
+                        {"params": sm_params, "lr": lr * opt_cfg.score_mix_lr_multiplier, "weight_decay": wd},
+                    ]
+                logger.info(
+                    f"score_mix LR: {lr * opt_cfg.score_mix_lr_multiplier:.2e} "
+                    f"({opt_cfg.score_mix_lr_multiplier}x, {len(score_mix_ids)} params)"
+                )
+
         if opt_cfg.optimizer_type == "adamw":
             optimizer = AdamW(param_groups, lr=lr, weight_decay=wd)
         elif opt_cfg.optimizer_type == "adamw8bit":
@@ -1297,6 +1353,18 @@ class LtxvTrainer:
 
         # noinspection PyTypeChecker
         self._optimizer, self._lr_scheduler = self._accelerator.prepare(optimizer, lr_scheduler)
+
+        # DMD-VFM v3a: create discriminator optimizer
+        if self._fake_score_net is not None:
+            from ltx_trainer.training_strategies.vfm_strategy_v3a import DMDVFMv3aTrainingStrategy  # noqa: PLC0415
+            if isinstance(self._training_strategy, DMDVFMv3aTrainingStrategy):
+                disc_lr = self._training_strategy.config.disc_lr
+                disc_optimizer = AdamW(
+                    self._fake_score_net.parameters(), lr=disc_lr,
+                    betas=(0.0, 0.999), weight_decay=0.01,  # beta1=0 per FlashMotion
+                )
+                self._training_strategy.set_fake_score_optimizer(disc_optimizer)
+                logger.info(f"DMD-VFM v3a: Discriminator optimizer created (lr={disc_lr}, beta1=0)")
 
     def _create_scheduler(self, optimizer: torch.optim.Optimizer) -> LRScheduler | None:
         """Create learning rate scheduler based on config."""
@@ -1579,6 +1647,13 @@ class LtxvTrainer:
                 save_file(sigma_sd, sigma_path)
                 logger.info(f"💾 SigmaHead for step {self._global_step} saved in {sigma_path.relative_to(self._config.output_dir)}")
 
+            # Save FakeScoreNetwork (DMD-VFM v3a)
+            if self._fake_score_net is not None:
+                score_path = save_dir / f"fake_score_step_{self._global_step:05d}.safetensors"
+                score_sd = {k: v.to(save_dtype) for k, v in self._fake_score_net.state_dict().items()}
+                save_file(score_sd, score_path)
+                logger.info(f"💾 FakeScoreNet for step {self._global_step} saved in {score_path.relative_to(self._config.output_dir)}")
+
             # Save strategy params
             strategy_sd = {}
             if hasattr(self._training_strategy, "get_strategy_state_dict"):
@@ -1733,9 +1808,13 @@ class LtxvTrainer:
         try:
             from torchvision.utils import save_image
 
-            raw_latents = model_inputs._raw_video_latents  # [B, C, F, H, W]
-            noise = model_inputs.shared_noise  # [B, seq_len, C] (patchified)
-            sigmas = model_inputs.shared_sigmas
+            raw_latents = getattr(model_inputs, "_raw_video_latents", None)
+            if raw_latents is None:
+                return
+            noise = getattr(model_inputs, "shared_noise", None)
+            sigmas = getattr(model_inputs, "shared_sigmas", None)
+            if noise is None or sigmas is None:
+                return
 
             b, c, f, h, w = raw_latents.shape
 

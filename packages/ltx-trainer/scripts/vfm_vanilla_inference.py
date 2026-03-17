@@ -146,6 +146,37 @@ def main():
 
     prompt_embeds = prompt_embeds.to(device)
     prompt_mask = prompt_mask.to(device)
+
+    # Apply caption_projection shim if cached embeddings are 3840-dim (pre-projection)
+    # LTX-2.3 expects 4096-dim; the caption_projection from LTX-2 transforms 3840→4096
+    if prompt_embeds.shape[-1] == 3840:
+        print(f"  Applying caption_projection shim (3840 → 4096)...")
+        from safetensors import safe_open  # noqa: PLC0415
+        from ltx_core.model.transformer.text_projection import PixArtAlphaTextProjection  # noqa: PLC0415
+        caption_proj = PixArtAlphaTextProjection(in_features=3840, hidden_size=4096)
+        # Load weights from LTX-2 checkpoint (or current model)
+        ltx2_path = "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+        source_path = ltx2_path if os.path.exists(ltx2_path) else args.model_path
+        with safe_open(source_path, framework="pt") as f:
+            prefix = "model.diffusion_model.caption_projection."
+            for key in f.keys():
+                if key.startswith(prefix):
+                    param_name = key[len(prefix):]
+                    param = f.get_tensor(key)
+                    parts = param_name.split(".")
+                    obj = caption_proj
+                    for part in parts[:-1]:
+                        obj = getattr(obj, part)
+                    setattr(obj, parts[-1], torch.nn.Parameter(param))
+        caption_proj = caption_proj.to(device=device, dtype=dtype).eval()
+        with torch.inference_mode():
+            B = prompt_embeds.shape[0]
+            prompt_embeds = caption_proj(prompt_embeds.to(dtype)).view(B, -1, 4096)
+        del caption_proj
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"  Post-projection shape: {prompt_embeds.shape}")
+
     text_embed_dim = prompt_embeds.shape[-1]
 
     # ══════════════════════════════════════════════════════════════════

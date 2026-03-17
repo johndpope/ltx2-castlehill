@@ -45,6 +45,16 @@ class TextToVideoConfig(TrainingStrategyConfigBase):
         description="Directory name for audio latents when with_audio is True",
     )
 
+    log_reconstructions: bool = Field(
+        default=False,
+        description="Log target/predict/source reconstruction images to W&B",
+    )
+
+    reconstruction_log_interval: int = Field(
+        default=50,
+        description="Log reconstruction images every N training steps",
+    )
+
 
 class TextToVideoStrategy(TrainingStrategy):
     """Text-to-video training strategy.
@@ -190,7 +200,7 @@ class TextToVideoStrategy(TrainingStrategy):
                 dtype=dtype,
             )
 
-        return ModelInputs(
+        inputs = ModelInputs(
             video=video_modality,
             audio=audio_modality,
             video_targets=video_targets,
@@ -198,6 +208,14 @@ class TextToVideoStrategy(TrainingStrategy):
             video_loss_mask=video_loss_mask,
             audio_loss_mask=audio_loss_mask,
         )
+
+        # Store raw latents + noise for reconstruction logging
+        inputs._raw_video_latents = batch["latents"]["latents"]  # [B, C, F, H, W]
+        inputs._noisy_video = noisy_video  # [B, seq_len, C] patchified
+        inputs._video_noise = video_noise
+        inputs._video_sigmas = sigmas
+
+        return inputs
 
     def _prepare_audio_inputs(
         self,
@@ -289,3 +307,103 @@ class TextToVideoStrategy(TrainingStrategy):
 
         # Combined loss
         return video_loss + audio_loss
+
+    def log_reconstructions_to_wandb(
+        self,
+        video_pred: Tensor,
+        inputs: ModelInputs,
+        step: int,
+        vae_decoder: torch.nn.Module | None = None,
+        prefix: str = "train",
+    ) -> dict[str, Any]:
+        """Log target/predict/source reconstruction images to W&B.
+
+        Decodes one sample from the batch through the VAE and logs a triplet:
+        source (noisy input) | predict (denoised) | target (ground truth).
+        """
+        try:
+            import wandb
+        except ImportError:
+            return {}
+        if wandb.run is None or not self.config.log_reconstructions:
+            return {}
+
+        raw_latents = getattr(inputs, "_raw_video_latents", None)
+        if raw_latents is None or vae_decoder is None:
+            return {}
+
+        import random as _random
+
+        b, c, f, h, w = raw_latents.shape
+
+        # Reconstruct clean prediction from velocity: pred_clean = noisy - sigma * velocity
+        # In flow matching: noisy = (1-σ)x₀ + σε, target = ε - x₀, pred ≈ target
+        # So x₀_hat = noisy - σ * pred = (1-σ)x₀ + σε - σ(ε - x₀) = x₀
+        noisy_video = getattr(inputs, "_noisy_video", None)
+        sigmas = getattr(inputs, "_video_sigmas", None)
+        if noisy_video is None or sigmas is None:
+            return {}
+
+        sigmas_expanded = sigmas.view(-1, 1, 1)
+        pred_clean = noisy_video - sigmas_expanded * video_pred  # [B, seq_len, C]
+
+        # Unpatchify to [B, C, F, H, W]
+        from ltx_core.types import VideoLatentShape  # noqa: PLC0415
+        output_shape = VideoLatentShape(batch=b, channels=c, frames=f, height=h, width=w)
+        pred_spatial = self._video_patchifier.unpatchify(pred_clean, output_shape)
+        noisy_spatial = self._video_patchifier.unpatchify(noisy_video, output_shape)
+
+        sample_idx = _random.randint(0, b - 1) if b > 1 else 0
+
+        log_dict: dict[str, Any] = {}
+        try:
+            decoder_device = next(vae_decoder.parameters()).device
+            decoder_dtype = next(vae_decoder.parameters()).dtype
+            with torch.inference_mode():
+                gt_decoded = vae_decoder(
+                    raw_latents[sample_idx:sample_idx + 1].to(device=decoder_device, dtype=decoder_dtype)
+                )
+                pred_decoded = vae_decoder(
+                    pred_spatial[sample_idx:sample_idx + 1].to(device=decoder_device, dtype=decoder_dtype)
+                )
+                noisy_decoded = vae_decoder(
+                    noisy_spatial[sample_idx:sample_idx + 1].to(device=decoder_device, dtype=decoder_dtype)
+                )
+
+            # [-1, 1] -> [0, 1]
+            gt_decoded = gt_decoded.float().clamp(-1, 1) * 0.5 + 0.5
+            pred_decoded = pred_decoded.float().clamp(-1, 1) * 0.5 + 0.5
+            noisy_decoded = noisy_decoded.float().clamp(-1, 1) * 0.5 + 0.5
+
+            # [1, 3, T, H, W] -> [3, T, H, W]
+            gt_frames = gt_decoded[0].cpu()
+            pred_frames = pred_decoded[0].cpu()
+            noisy_frames = noisy_decoded[0].cpu()
+
+            # Mid-frame triplet image: source | predict | target
+            mid_f = gt_frames.shape[1] // 2
+            import torchvision.utils as vutils
+
+            grid = vutils.make_grid(
+                [noisy_frames[:, mid_f], pred_frames[:, mid_f], gt_frames[:, mid_f]],
+                nrow=3, padding=4, normalize=False,
+            )
+            log_dict[f"{prefix}/reconstruction"] = wandb.Image(
+                grid.permute(1, 2, 0).numpy(),
+                caption=f"Step {step} | Source (noisy) | Predict | Target (GT)",
+            )
+
+            # Also log as video if multi-frame
+            if gt_frames.shape[1] > 1:
+                side_by_side = torch.cat([noisy_frames, pred_frames, gt_frames], dim=-1)
+                video_np = (side_by_side.permute(1, 0, 2, 3) * 255).clamp(0, 255).to(torch.uint8).numpy()
+                log_dict[f"{prefix}/reconstruction_video"] = wandb.Video(
+                    video_np, fps=8,
+                    caption=f"Step {step} | Source | Predict | Target",
+                )
+
+            logger.debug(f"Logged reconstruction triplet at step {step}")
+        except Exception as e:
+            logger.warning(f"Failed to decode reconstructions: {e}")
+
+        return log_dict
