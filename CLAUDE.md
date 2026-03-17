@@ -42,6 +42,30 @@ When working on this project, **eagerly anticipate** the user's goals and sugges
 - **v2b Multi-Resolution Speculative Training** (SSD #3): Same noise z at K sigma levels [1.0, 0.7, 0.5, 0.3] in ONE batched DiT pass. K× training signal for <2× cost. Consistency loss across ODE paths. See [docs/SSD.md](docs/SSD.md).
 - **Async Adapter-DiT Pipeline** (SSD #5): CUDA streams to hide adapter latency. ~4% free speedup.
 
+### GPU Layout (msi workstation)
+**WARNING: nvidia-smi and PyTorch REVERSE the GPU indices!**
+| nvidia-smi | PyTorch | GPU | VRAM | Role |
+|------------|---------|-----|------|------|
+| GPU 0 | cuda:1 | RTX PRO 4000 Blackwell | 24GB | VAE, text encoder |
+| GPU 1 | cuda:0 | RTX 5090 | 32GB | Transformer (training) |
+
+Always use **PyTorch indices** in config files:
+```yaml
+hardware:
+  devices:
+    transformer: "cuda:0"      # RTX 5090 32GB
+    vae_decoder: "cuda:1"      # RTX PRO 4000 24GB
+    vae_encoder: "cuda:1"
+```
+
+### Grok MCP Integration
+When using the Grok MCP tool for research/architecture questions:
+- **Always reuse the existing session ID** to maintain conversation continuity
+- **Be maximally verbose** — include full file contents, code snippets, training results, W&B links
+- **Attach context** via `grok_add_context` before asking questions — Grok has no access to our codebase
+- **Include concrete numbers**: loss values, VRAM usage, step counts, model sizes
+- The current session ID should be stored and reused across the conversation
+
 ### Hard-Won Lessons (DO NOT repeat these mistakes)
 1. **KL weight**: Start at 0.001, not 0.1 or 3.0. Spherical KL with clamped kappa creates a constant floor (~14.8) that dominates flow matching loss at any weight >0.01.
 2. **SigmaHead must see x₀**: The adapter's text+position features CANNOT encode content complexity. SigmaHead(adapter_mu) → flat sigma. SigmaHead(x₀, adapter_mu) → spatial variation.

@@ -486,6 +486,12 @@ class CliffordVideoAttention(nn.Module):
         else:
             self.score_mix = None
 
+        # Learned per-head sigmoid gates (replaces softmax over shifts)
+        # Each position projects to per-head, per-shift gate values [0,1]
+        # This ensures ALL shifts contribute (no winner-take-all suppression)
+        inner_dim = dim_head * heads
+        self.shift_gate_proj = nn.Linear(inner_dim, self.total_shifts * heads, bias=True)
+
         self.spherical_norm = spherical_norm
         self.num_frames = num_frames
 
@@ -651,12 +657,20 @@ class CliffordVideoAttention(nn.Module):
                         shift_mask.expand_as(scores[:, :, :, :, idx]) == 0, -1e9
                     )
 
-            # Softmax over total_shifts dimension
-            attn_weights = F.softmax(scores, dim=-1)  # [B, T, S, H, total_shifts]
+            # Sigmoid-gated weighted average (replaces softmax over shifts)
+            # Softmax is winner-take-all, suppressing most of the 16 shifts.
+            # Sigmoid gates let ALL shifts contribute proportionally.
+            # Gate logits are projected from input x (content-dependent gating).
+            gate_logits = self.shift_gate_proj(x.view(B, L, -1))  # [B, L, total_shifts * H]
+            gates = torch.sigmoid(gate_logits.view(B, T, S, H, self.total_shifts))  # [0,1] per shift
 
-            # Weighted sum of shifted values
+            # Also modulate by score relevance (score-weighted gates)
+            gates = gates * torch.sigmoid(scores)  # combine content gates with score gates
+
             v_stack = torch.stack(all_shifted_v, dim=4)  # [B, T, S, H, total_shifts, D]
-            out = (attn_weights.unsqueeze(-1) * v_stack).sum(dim=4)  # [B, T, S, H, D]
+            weighted_v = gates.unsqueeze(-1) * v_stack  # [B, T, S, H, total_shifts, D]
+            gate_sum = gates.sum(dim=-1, keepdim=True).clamp(min=1e-6)  # [B, T, S, H, 1]
+            out = weighted_v.sum(dim=4) / gate_sum  # Normalized weighted average
 
             # Reshape back to [B, L, H*D]
             out = out.reshape(B, L, H * D)

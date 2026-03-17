@@ -73,37 +73,39 @@ def main():
             swapped += 1
     print(f"Swapped {swapped} blocks")
 
-    # Load LoRA
-    from scripts.inference import load_lora_weights
-    transformer = load_lora_weights(transformer, args.lora_path)
-
-    # Quantize and move to GPU
+    # Quantize first, then load LoRA (matches training order)
     print("Quantizing...")
     transformer = quantize_model(transformer, precision="int8-quanto", device=device)
-    transformer = transformer.to(device).eval()
+    transformer = transformer.to(device)
+
+    # Load LoRA on top of quantized model
+    from scripts.inference import load_lora_weights
+    transformer = load_lora_weights(transformer, args.lora_path)
+    transformer = transformer.eval()
     print(f"Transformer on GPU: {torch.cuda.memory_allocated() / 1e9:.1f}GB")
 
-    # 2. Load embeddings processor (lightweight)
-    from ltx_trainer.model_loader import load_embeddings_processor
-    emb_proc = load_embeddings_processor(args.checkpoint, device=device)
-
-    # 3. Load VAE decoder to CPU (will move to GPU for decode, then back)
+    # 2. Load VAE decoder to CPU (will move to GPU for decode, then back)
     from ltx_trainer.model_loader import load_video_vae_decoder
     vae = load_video_vae_decoder(args.checkpoint, device="cpu", dtype=torch.bfloat16)
 
     # 4. Load data samples
     from ltx_core.components.patchifiers import VideoLatentPatchifier
     from ltx_core.model.transformer.modality import Modality
-    from ltx_core.model.transformer.timestep_embedding import get_timestep_embedding
+    # timestep embedding is handled internally by the model
     from ltx_core.components.schedulers import LTX2Scheduler
+    from ltx_core.types import VideoLatentShape, SpatioTemporalScaleFactors
+    from ltx_core.tools import get_pixel_coords
+
+    VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
 
     data_root = Path(args.data_root)
     latent_files = sorted((data_root / "latents").glob("*.pt"))[:args.num_samples]
     cond_files = sorted((data_root / "conditions_final").glob("*.pt"))[:args.num_samples]
 
-    patchifier = VideoLatentPatchifier()
+    patchifier = VideoLatentPatchifier(patch_size=1)
     scheduler = LTX2Scheduler()
-    sigmas = scheduler.get_sigmas(args.num_steps, device=device)
+    sigmas = scheduler.execute(args.num_steps).to(device)
+    fps = 25.0
 
     all_triplets = []
 
@@ -121,21 +123,8 @@ def main():
         video_feats = cond_data["video_prompt_embeds"].unsqueeze(0).to(device, dtype=torch.bfloat16)
         mask = cond_data["prompt_attention_mask"].unsqueeze(0).to(device)
 
-        # Check if these are final embeddings (already through connector)
-        is_final = cond_data.get("is_final_embedding", False)
-        if is_final:
-            # Apply caption projection if transformer has one
-            if hasattr(transformer, "caption_projection") and transformer.caption_projection is not None:
-                with torch.inference_mode():
-                    video_embeds = transformer.caption_projection(video_feats)
-            else:
-                video_embeds = video_feats
-        else:
-            # Apply embeddings processor
-            additive_mask = (1 - mask.float()) * -1e9
-            additive_mask = additive_mask.unsqueeze(1).to(dtype=torch.bfloat16)
-            with torch.inference_mode():
-                video_embeds, _, _ = emb_proc.create_embeddings(video_feats, video_feats, additive_mask)
+        # Pass raw 3840-dim features — the transformer's caption_projection handles 3840→4096
+        video_embeds = video_feats
 
         # Patchify target
         target_patched = patchifier.patchify(target_latents)
@@ -149,8 +138,17 @@ def main():
         test_sigma = 0.5
         noisy_patched = (1 - test_sigma) * target_patched + test_sigma * noise
 
-        # Positions
-        positions = patchifier.get_latent_pos(f, h, w, device=device, dtype=torch.bfloat16).unsqueeze(0)
+        # Positions (same as training strategy)
+        latent_coords = patchifier.get_patch_grid_bounds(
+            output_shape=VideoLatentShape(frames=f, height=h, width=w, batch=1, channels=c),
+            device=device,
+        )
+        positions = get_pixel_coords(
+            latent_coords=latent_coords,
+            scale_factors=VIDEO_SCALE_FACTORS,
+            causal_fix=True,
+        ).to(torch.bfloat16)
+        positions[:, 0, ...] = positions[:, 0, ...] / fps
 
         # Denoise
         print(f"  Denoising from sigma={test_sigma:.2f} ({args.num_steps} steps)...")
@@ -162,25 +160,18 @@ def main():
         with torch.inference_mode():
             for step_i, (sc, sn) in enumerate(zip(active_sigmas[:-1], active_sigmas[1:])):
                 sb = sc.unsqueeze(0)
-                ts = get_timestep_embedding(
-                    sb.unsqueeze(1).expand(-1, seq_len) * transformer.timestep_scale_multiplier,
-                    transformer.inner_dim, dtype=torch.bfloat16,
-                )
+                # Per-token timestep: scalar sigma broadcast to all tokens, then embed
+                # Per-token timestep: raw sigma values (model embeds internally)
+                ts = sb.unsqueeze(1).expand(-1, seq_len).to(torch.bfloat16)  # [1, seq_len]
                 vm = Modality(
                     enabled=True, latent=x, sigma=sb, timesteps=ts,
                     positions=positions, context=video_embeds, context_mask=None,
                 )
-                am = Modality(
-                    enabled=False,
-                    latent=torch.zeros(1, 0, 128, device=device, dtype=torch.bfloat16),
-                    sigma=sb,
-                    timesteps=torch.zeros(1, 0, transformer.inner_dim, device=device, dtype=torch.bfloat16),
-                    positions=torch.zeros(1, 1, 0, 2, device=device, dtype=torch.bfloat16),
-                    context=torch.zeros(1, 0, 2048, device=device, dtype=torch.bfloat16),
-                    context_mask=None,
-                )
-                vo, _ = transformer(video=vm, audio=am)
-                x = x + vo.x * (sn - sc)
+                result = transformer(video=vm, audio=None, perturbations=None)
+                # Model returns (video_out, audio_out) - video_out may be NamedTuple or Tensor
+                vo = result[0] if isinstance(result, tuple) else result
+                velocity = vo.x if hasattr(vo, 'x') else vo
+                x = x + velocity * (sn - sc)
 
         print("  Denoising done. Decoding via VAE...")
 

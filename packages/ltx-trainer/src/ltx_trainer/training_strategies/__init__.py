@@ -32,12 +32,13 @@ from ltx_trainer.training_strategies.vfm_strategy_v1h import VFMv1hTrainingConfi
 from ltx_trainer.training_strategies.vfm_strategy_v2a import VFMv2aTrainingConfig, VFMv2aTrainingStrategy
 from ltx_trainer.training_strategies.vfm_strategy_v2b import VFMv2bTrainingConfig, VFMv2bTrainingStrategy
 from ltx_trainer.training_strategies.vfm_strategy_v3a import DMDVFMv3aTrainingConfig, DMDVFMv3aTrainingStrategy
+from ltx_trainer.training_strategies.vfm_strategy_v3b import SelfEVFMv3bTrainingConfig, SelfEVFMv3bTrainingStrategy
 from ltx_trainer.training_strategies.vfm_distill_strategy import VFMDistillConfig, VFMDistillStrategy
 from ltx_trainer.training_strategies.vfm_scd_distill_strategy import VFMSCDDistillConfig, VFMSCDDistillStrategy
 from ltx_trainer.training_strategies.isogen_strategy import IsoGenTrainingConfig, IsoGenTrainingStrategy
 
 # Type alias for all strategy config types
-TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | SCDTrainingConfig | VFMSCDDistillConfig | VFMSCDTrainingConfig | VFMTrainingConfig | VFMv1bTrainingConfig | VFMv1cTrainingConfig | VFMv1dTrainingConfig | VFMv1eTrainingConfig | VFMv1fTrainingConfig | VFMv12fTrainingConfig | VFMv1gTrainingConfig | VFMv1hTrainingConfig | VFMv2aTrainingConfig | VFMv2bTrainingConfig | DMDVFMv3aTrainingConfig | VFMDistillConfig | IsoGenTrainingConfig
+TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | SCDTrainingConfig | VFMSCDDistillConfig | VFMSCDTrainingConfig | VFMTrainingConfig | VFMv1bTrainingConfig | VFMv1cTrainingConfig | VFMv1dTrainingConfig | VFMv1eTrainingConfig | VFMv1fTrainingConfig | VFMv12fTrainingConfig | VFMv1gTrainingConfig | VFMv1hTrainingConfig | VFMv2aTrainingConfig | VFMv2bTrainingConfig | DMDVFMv3aTrainingConfig | SelfEVFMv3bTrainingConfig | VFMDistillConfig | IsoGenTrainingConfig
 
 __all__ = [
     "DEFAULT_FPS",
@@ -80,6 +81,8 @@ __all__ = [
     "VFMv2aTrainingStrategy",
     "DMDVFMv3aTrainingConfig",
     "DMDVFMv3aTrainingStrategy",
+    "SelfEVFMv3bTrainingConfig",
+    "SelfEVFMv3bTrainingStrategy",
     "VideoToVideoConfig",
     "VideoToVideoStrategy",
     "get_training_strategy",
@@ -112,6 +115,8 @@ def get_training_strategy(config: TrainingStrategyConfig) -> TrainingStrategy:
             strategy = IsoGenTrainingStrategy(config)
         case VFMDistillConfig():
             strategy = VFMDistillStrategy(config)
+        case SelfEVFMv3bTrainingConfig():
+            strategy = SelfEVFMv3bTrainingStrategy(config)
         case DMDVFMv3aTrainingConfig():
             strategy = DMDVFMv3aTrainingStrategy(config)
         case VFMv2bTrainingConfig():

@@ -1066,6 +1066,20 @@ class LtxvTrainer:
                 adapter_sd = load_file(str(adapter_path))
                 self._noise_adapter.load_state_dict(adapter_sd)
                 logger.info(f"📥 Loaded noise adapter from {adapter_path.name}")
+
+                # Auto-load SigmaHead if saved alongside noise adapter
+                sigma_head_path = adapter_path.parent / adapter_path.name.replace("noise_adapter_", "sigma_head_")
+                if sigma_head_path.exists() and hasattr(self._training_strategy, "_sigma_head") and self._training_strategy._sigma_head is not None:
+                    sigma_sd = load_file(str(sigma_head_path))
+                    self._training_strategy._sigma_head.load_state_dict(sigma_sd)
+                    logger.info(f"📥 Loaded SigmaHead from {sigma_head_path.name}")
+
+                # Auto-load FakeScoreNet/Discriminator if saved alongside
+                fake_score_path = adapter_path.parent / adapter_path.name.replace("noise_adapter_", "fake_score_")
+                if fake_score_path.exists() and self._fake_score_net is not None:
+                    score_sd = load_file(str(fake_score_path))
+                    self._fake_score_net.load_state_dict(score_sd)
+                    logger.info(f"📥 Loaded FakeScoreNet/Discriminator from {fake_score_path.name}")
             else:
                 logger.warning(f"⚠️ Noise adapter not found: {adapter_path}")
 
