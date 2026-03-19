@@ -94,6 +94,15 @@ class SelfEVFMv3bTrainingConfig(VFMv1fTrainingConfig):
         "Self-E's data loss already includes this, so typically 0.",
     )
 
+    # === Latent Perceptual Loss ===
+    latent_perceptual_weight: float = Field(
+        default=1.0, ge=0.0,
+        description="Weight for latent perceptual loss. Uses multi-scale features "
+        "from the latent tokens (local patches at 1x, 2x, 4x pooling) to compute "
+        "structural similarity. More perceptually meaningful than raw MSE. "
+        "0 = disabled.",
+    )
+
     # === Flow Distribution Matching (from v3a, kept for temporal consistency) ===
     flow_match_weight: float = Field(
         default=0.0, ge=0.0,
@@ -248,6 +257,16 @@ class SelfEVFMv3bTrainingStrategy(VFMv1fTrainingStrategy):
         total_loss = data_loss
 
         # ════════════════════════════════════════════════════════════
+        # LATENT PERCEPTUAL LOSS (multi-scale structural similarity)
+        # ════════════════════════════════════════════════════════════
+        loss_perceptual = torch.tensor(0.0, device=device)
+        if cfg.latent_perceptual_weight > 0:
+            loss_perceptual = self._compute_latent_perceptual_loss(
+                x_hat_0, video_latents, positions
+            )
+            total_loss = total_loss + cfg.latent_perceptual_weight * loss_perceptual
+
+        # ════════════════════════════════════════════════════════════
         # SELF-EVALUATION LOSS (Eq. 15-20 in Self-E)
         # ════════════════════════════════════════════════════════════
         apply_self_eval = (
@@ -300,6 +319,49 @@ class SelfEVFMv3bTrainingStrategy(VFMv1fTrainingStrategy):
             total_loss = total_loss + cfg.kl_weight * adapter_kl
 
         # ════════════════════════════════════════════════════════════
+        # OBS LOSS (VFM paper Eq.14 — forces text-conditioned adapter)
+        # ════════════════════════════════════════════════════════════
+        loss_obs = torch.tensor(0.0, device=device)
+        if use_adapter and cfg.obs_loss_weight > 0:
+            # Add noise to GT, compare adapter-denoised output
+            obs_noise = torch.randn_like(video_latents) * cfg.obs_noise_level
+            noisy_gt = video_latents + obs_noise
+            obs_diff = (x_hat_0 - noisy_gt).pow(2)
+            if inputs.video_loss_mask is not None:
+                mask = inputs.video_loss_mask.unsqueeze(-1).float()
+                loss_obs = (obs_diff * mask).sum() / mask.sum().clamp(min=1) / obs_diff.shape[-1]
+            else:
+                loss_obs = obs_diff.mean()
+            total_loss = total_loss + cfg.obs_loss_weight * loss_obs
+
+        # ════════════════════════════════════════════════════════════
+        # MU ALIGNMENT (anti-collapse: adapter mu must point toward x₀)
+        # ════════════════════════════════════════════════════════════
+        loss_mu_align = torch.tensor(0.0, device=device)
+        adapter_mu = getattr(inputs, "_vfm_adapter_mu", None)
+        if adapter_mu is not None and cfg.mu_align_weight > 0:
+            # Cosine alignment: mu should point in same direction as x₀
+            mu_norm = F.normalize(adapter_mu, dim=-1)
+            x0_norm = F.normalize(video_latents, dim=-1)
+            cos_align = (mu_norm * x0_norm).sum(dim=-1).mean()
+            loss_mu_align = 1 - cos_align
+            total_loss = total_loss + cfg.mu_align_weight * loss_mu_align
+
+        # ════════════════════════════════════════════════════════════
+        # DIVERSITY (prevent adapter collapse to single noise pattern)
+        # ════════════════════════════════════════════════════════════
+        loss_diversity = torch.tensor(0.0, device=device)
+        if adapter_mu is not None and cfg.diversity_weight > 0 and adapter_mu.shape[0] > 1:
+            # Cross-sample diversity: different prompts should give different mu
+            mu_flat = adapter_mu.mean(dim=1)  # [B, C]
+            mu_flat_norm = F.normalize(mu_flat, dim=-1)
+            sim_matrix = torch.mm(mu_flat_norm, mu_flat_norm.T)
+            # Penalize high similarity between different samples
+            mask_diag = 1 - torch.eye(sim_matrix.shape[0], device=device)
+            loss_diversity = (sim_matrix * mask_diag).mean()
+            total_loss = total_loss + cfg.diversity_weight * loss_diversity
+
+        # ════════════════════════════════════════════════════════════
         # LOGGING
         # ════════════════════════════════════════════════════════════
         if step % 20 == 0:
@@ -307,17 +369,79 @@ class SelfEVFMv3bTrainingStrategy(VFMv1fTrainingStrategy):
                 import wandb  # noqa: PLC0415
                 if wandb.run is not None:
                     log_data = {
+                        # Log under BOTH v3b/ and vfm/ so W&B panels work
                         "v3b/loss_data": data_loss.item(),
+                        "v3b/loss_perceptual": loss_perceptual.item() if isinstance(loss_perceptual, Tensor) else loss_perceptual,
                         "v3b/loss_self_eval": loss_self_eval.item() if isinstance(loss_self_eval, Tensor) else loss_self_eval,
+                        "v3b/loss_obs": loss_obs.item() if isinstance(loss_obs, Tensor) else loss_obs,
+                        "v3b/loss_mu_align": loss_mu_align.item() if isinstance(loss_mu_align, Tensor) else loss_mu_align,
+                        "v3b/loss_diversity": loss_diversity.item() if isinstance(loss_diversity, Tensor) else loss_diversity,
                         "v3b/loss_kl": adapter_kl.item() if isinstance(adapter_kl, Tensor) else adapter_kl,
                         "v3b/loss_total": total_loss.item(),
                         "v3b/self_eval_applied": float(apply_self_eval),
                         "v3b/student_recon_mse": (x_hat_0 - video_latents).pow(2).mean().item(),
+                        # Mirror to vfm/ prefix for existing W&B panels
+                        "vfm/loss_obs": loss_obs.item() if isinstance(loss_obs, Tensor) else loss_obs,
+                        "vfm/loss_kl": adapter_kl.item() if isinstance(adapter_kl, Tensor) else adapter_kl,
+                        "vfm/loss_mu_align": loss_mu_align.item() if isinstance(loss_mu_align, Tensor) else loss_mu_align,
+                        "vfm/loss_mf": data_loss.item(),
+                        "vfm/loss_total": total_loss.item(),
                     }
                     # Don't pass step= to avoid conflicting with trainer's wandb.log calls
                     wandb.log(log_data)
             except Exception:
                 pass
+
+        return total_loss
+
+    @staticmethod
+    def _compute_latent_perceptual_loss(
+        pred: Tensor,
+        target: Tensor,
+        positions: Tensor,
+    ) -> Tensor:
+        """Multi-scale latent perceptual loss on token sequences.
+
+        Computes structural similarity at multiple scales by treating the
+        token sequence as a 1D signal and pooling at different window sizes.
+        No spatial reshape needed — works regardless of H/W/F dims.
+
+        Three components:
+        1. Cosine similarity (structural alignment, scale-invariant)
+        2. L1 (magnitude errors)
+        3. Multi-scale: pool tokens in groups of 1, 4, 16 for local→global features
+
+        Args:
+            pred: [B, seq, C] predicted latent tokens
+            target: [B, seq, C] ground truth latent tokens
+            positions: unused (kept for API compat)
+        """
+        B, seq_len, C = pred.shape
+        device = pred.device
+
+        total_loss = torch.tensor(0.0, device=device)
+
+        # Scale 1: per-token cosine + L1 (fine detail)
+        p_norm = F.normalize(pred, dim=-1)
+        t_norm = F.normalize(target, dim=-1)
+        cos_sim = (p_norm * t_norm).sum(dim=-1).mean()
+        total_loss = total_loss + (1 - cos_sim) + 0.5 * (pred - target).abs().mean()
+
+        # Scale 2: pool groups of 4 tokens (local neighborhood)
+        if seq_len >= 4:
+            trim = seq_len - (seq_len % 4)
+            p4 = pred[:, :trim].reshape(B, trim // 4, 4, C).mean(dim=2)
+            t4 = target[:, :trim].reshape(B, trim // 4, 4, C).mean(dim=2)
+            cos4 = (F.normalize(p4, dim=-1) * F.normalize(t4, dim=-1)).sum(-1).mean()
+            total_loss = total_loss + 0.5 * (1 - cos4) + 0.25 * (p4 - t4).abs().mean()
+
+        # Scale 3: pool groups of 16 tokens (global composition)
+        if seq_len >= 16:
+            trim = seq_len - (seq_len % 16)
+            p16 = pred[:, :trim].reshape(B, trim // 16, 16, C).mean(dim=2)
+            t16 = target[:, :trim].reshape(B, trim // 16, 16, C).mean(dim=2)
+            cos16 = (F.normalize(p16, dim=-1) * F.normalize(t16, dim=-1)).sum(-1).mean()
+            total_loss = total_loss + 0.25 * (1 - cos16) + 0.125 * (p16 - t16).abs().mean()
 
         return total_loss
 
@@ -329,9 +453,123 @@ class SelfEVFMv3bTrainingStrategy(VFMv1fTrainingStrategy):
         vae_decoder: torch.nn.Module | None = None,
         prefix: str = "train",
     ) -> dict[str, Any]:
-        """Log v1f reconstructions + Self-E specific metrics."""
+        """Log v1f reconstructions + distribution variation samples.
+
+        Generates K different samples from the adapter for the same prompt
+        to visualize distribution diversity (collapsed vs diverse).
+        """
         log_dict = super().log_reconstructions_to_wandb(
             video_pred=video_pred, inputs=inputs, step=step,
             vae_decoder=vae_decoder, prefix=prefix,
         )
+
+        # Generate variation samples from the distribution
+        if self._transformer_ref is not None and vae_decoder is not None:
+            try:
+                variation_plots = self._log_distribution_variations(
+                    inputs, step, vae_decoder, prefix, num_variations=3,
+                )
+                log_dict.update(variation_plots)
+            except Exception as e:
+                logger.debug(f"Distribution variation logging failed: {e}")
+
         return log_dict
+
+    def _log_distribution_variations(
+        self,
+        inputs: ModelInputs,
+        step: int,
+        vae_decoder: torch.nn.Module,
+        prefix: str,
+        num_variations: int = 3,
+    ) -> dict[str, Any]:
+        """Sample K different z's from the adapter, denoise each, show side-by-side.
+
+        Shows: GT | Sample1 | Sample2 | Sample3
+        If all samples look the same → distribution collapsed.
+        If samples vary meaningfully → distribution is diverse.
+        """
+        import wandb  # noqa: PLC0415
+        from ltx_core.model.transformer.modality import Modality  # noqa: PLC0415
+        from ltx_core.components.patchifiers import VideoLatentPatchifier  # noqa: PLC0415
+        from ltx_core.types import VideoLatentShape  # noqa: PLC0415
+
+        use_adapter = getattr(inputs, "_vfm_use_adapter", False)
+        raw_latents = getattr(inputs, "_raw_video_latents", None)
+        if not use_adapter or raw_latents is None or self._noise_adapter is None:
+            return {}
+
+        device = inputs.video.latent.device
+        dtype = inputs.video.latent.dtype
+        text_embeds = inputs.video.context
+        text_mask = inputs.video.context_mask
+        positions = inputs.video.positions
+
+        # Get adapter reference
+        adapter = self._noise_adapter
+        task_class = getattr(inputs, "_vfm_task_class", None)
+        if task_class is None:
+            task_class = torch.tensor([0], device=device)
+
+        patchifier = VideoLatentPatchifier(patch_size=1)
+        gt = raw_latents[0]  # [C, F, H, W]
+        C, F, H, W = gt.shape
+
+        variation_frames = []
+
+        with torch.inference_mode():
+            # Decode GT first frame for reference
+            gt_pixels = vae_decoder(gt.unsqueeze(0).to(vae_decoder.parameters().__next__().device))
+            gt_frame = gt_pixels[0, :, 0].clamp(0, 1)  # First frame [C, H, W]
+            variation_frames.append(gt_frame.cpu())
+
+            # Generate K variations
+            for k in range(num_variations):
+                # Sample new z from adapter (different random seed each time)
+                torch.manual_seed(step * 1000 + k + 42)
+                adapter_out = adapter.forward(
+                    text_embeddings=text_embeds[:1].float(),
+                    text_mask=text_mask[:1].bool() if text_mask is not None else None,
+                    positions=positions[:1].float(),
+                    task_class=task_class,
+                )
+                mu_k, log_sigma_k = adapter_out[0], adapter_out[1]
+                sigma_k = torch.exp(log_sigma_k)
+                eps_k = torch.randn_like(mu_k)
+                z_k = (mu_k + sigma_k * eps_k).to(dtype)
+
+                # 1-step denoise
+                seq_len = z_k.shape[1]
+                sigma_val = torch.ones(1, device=device, dtype=dtype)
+                timesteps = torch.ones(1, seq_len, device=device, dtype=dtype)
+
+                video_mod = Modality(
+                    enabled=True, latent=z_k, sigma=sigma_val,
+                    timesteps=timesteps, positions=positions[:1],
+                    context=text_embeds[:1], context_mask=text_mask[:1] if text_mask is not None else None,
+                )
+                result = self._transformer_ref(video=video_mod, audio=None, perturbations=None)
+                vo = result[0] if isinstance(result, tuple) else result
+                v_pred = vo.x if hasattr(vo, 'x') else vo
+                x_hat = z_k - v_pred
+
+                # Unpatchify and decode
+                x_spatial = patchifier.unpatchify(
+                    x_hat,
+                    output_shape=VideoLatentShape(frames=F, height=H, width=W, batch=1, channels=C),
+                )
+                pixels_k = vae_decoder(x_spatial.to(vae_decoder.parameters().__next__().device))
+                frame_k = pixels_k[0, :, 0].clamp(0, 1).cpu()  # First frame
+                variation_frames.append(frame_k)
+
+        # Stack side-by-side: [GT | Var1 | Var2 | Var3]
+        import torchvision  # noqa: PLC0415
+        grid = torchvision.utils.make_grid(variation_frames, nrow=len(variation_frames), padding=2)
+        grid_np = (grid.permute(1, 2, 0).numpy() * 255).astype("uint8")
+
+        return {
+            f"{prefix}/distribution_variations": wandb.Image(
+                grid_np,
+                caption=f"Step {step} | GT | {num_variations} adapter samples (different z)"
+            ),
+        }

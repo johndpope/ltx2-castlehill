@@ -79,6 +79,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-num-heads", type=int, default=8)
     parser.add_argument("--adapter-pos-dim", type=int, default=256)
 
+    # Per-token sigma (SigmaHead)
+    parser.add_argument("--sigma-head-path", type=str, default=None,
+                        help="Path to trained SigmaHead checkpoint. "
+                        "Enables per-token sigma for spatially-varying denoising. "
+                        "Auto-detected from adapter path if not set.")
+    parser.add_argument("--two-pass", action="store_true",
+                        help="Two-pass inference: Pass 1 at uniform σ=1.0 → rough x̂₀, "
+                        "Pass 2 uses SigmaHead(rough x̂₀) for per-token σ → sharp x̂₀. "
+                        "Requires --sigma-head-path. ~2x latency but sharper output.")
+    parser.add_argument("--sigma-head-hidden-dim", type=int, default=256,
+                        help="Hidden dim for SigmaHead (must match training)")
+
+    # Multi-path ensemble (Chain-of-Steps reasoning, arXiv 2603.16870)
+    parser.add_argument("--ensemble", type=int, default=1,
+                        help="Number of adapter noise samples to ensemble. "
+                        "Each uses a different seed → different 'reasoning path'. "
+                        "Final output = average of K predictions. "
+                        "K=1 (default) = standard. K=3 = 3x compute, better quality.")
+
     return parser.parse_args()
 
 
@@ -274,6 +293,35 @@ def main():
     print(f"  Task: {args.task} (class {task_idx})")
 
     # ══════════════════════════════════════════════════════════════════
+    # Step 3b: Load SigmaHead (optional, for per-token sigma)
+    # ══════════════════════════════════════════════════════════════════
+    sigma_head = None
+    sigma_head_path = args.sigma_head_path
+    # Auto-detect from adapter path
+    if sigma_head_path is None and args.adapter_path:
+        auto_path = args.adapter_path.replace("noise_adapter_", "sigma_head_")
+        if os.path.exists(auto_path):
+            sigma_head_path = auto_path
+
+    if sigma_head_path and os.path.exists(sigma_head_path):
+        print(f"\n[3b/5] Loading SigmaHead from {sigma_head_path}...")
+        from ltx_trainer.training_strategies.vfm_strategy_v1d import SigmaHead  # noqa: PLC0415
+        sigma_head = SigmaHead(
+            input_dim=latent_channels,
+            hidden_dim=args.sigma_head_hidden_dim,
+        ).to(device=device)
+        sigma_sd = load_file(sigma_head_path)
+        sigma_head.load_state_dict(sigma_sd)
+        sigma_head.eval()
+        sh_params = sum(p.numel() for p in sigma_head.parameters())
+        print(f"  SigmaHead: {sh_params:,} params")
+        if args.two_pass:
+            print(f"  Two-pass mode: Pass 1 (uniform σ) → Pass 2 (per-token σ from SigmaHead)")
+    elif args.two_pass:
+        print("  WARNING: --two-pass requires sigma_head, falling back to single pass")
+        args.two_pass = False
+
+    # ══════════════════════════════════════════════════════════════════
     # Step 4: Load VAE decoder
     # ══════════════════════════════════════════════════════════════════
     print(f"\n[4/5] Loading VAE decoder on {args.vae_device}...")
@@ -284,7 +332,9 @@ def main():
     # ══════════════════════════════════════════════════════════════════
     # Step 5: Generate video
     # ══════════════════════════════════════════════════════════════════
-    print(f"\n[5/5] Generating video with {args.num_steps} VFM step(s)...")
+    ensemble_k = args.ensemble
+    print(f"\n[5/5] Generating video with {args.num_steps} VFM step(s)" +
+          (f", ensemble K={ensemble_k}" if ensemble_k > 1 else "") + "...")
     from ltx_core.components.patchifiers import VideoLatentPatchifier, get_pixel_coords
     from ltx_core.model.transformer.modality import Modality
     from ltx_core.types import SpatioTemporalScaleFactors, VideoLatentShape
@@ -334,20 +384,42 @@ def main():
 
             # Flow map evaluation
             if args.num_steps == 1:
-                timesteps = torch.ones(1, total_tokens, device=device, dtype=dtype)
                 sigma_val = torch.ones(1, device=device, dtype=dtype)
 
-                video_mod = Modality(
-                    enabled=True,
-                    latent=z,
-                    sigma=sigma_val,
-                    timesteps=timesteps,
-                    positions=positions,
-                    context=prompt_embeds,
-                    context_mask=prompt_mask,
-                )
-                v_pred, _ = transformer(video=video_mod, audio=None, perturbations=None)
-                x_out = z - v_pred
+                if args.two_pass and sigma_head is not None:
+                    # ── TWO-PASS INFERENCE ──
+                    # Pass 1: uniform σ=1.0 → rough x̂₀
+                    timesteps_uniform = torch.ones(1, total_tokens, device=device, dtype=dtype)
+                    video_mod_p1 = Modality(
+                        enabled=True, latent=z, sigma=sigma_val,
+                        timesteps=timesteps_uniform, positions=positions,
+                        context=prompt_embeds, context_mask=prompt_mask,
+                    )
+                    v_pred_p1, _ = transformer(video=video_mod_p1, audio=None, perturbations=None)
+                    rough_x0 = z - v_pred_p1
+
+                    # SigmaHead: (adapter_mu, rough x̂₀) → per-token σ
+                    with torch.no_grad():
+                        per_token_sigma = sigma_head(mu.to(dtype), rough_x0.float()).to(dtype)  # [1, seq]
+
+                    # Pass 2: per-token σ from SigmaHead → sharp x̂₀
+                    video_mod_p2 = Modality(
+                        enabled=True, latent=z, sigma=sigma_val,
+                        timesteps=per_token_sigma, positions=positions,
+                        context=prompt_embeds, context_mask=prompt_mask,
+                    )
+                    v_pred_p2, _ = transformer(video=video_mod_p2, audio=None, perturbations=None)
+                    x_out = z - v_pred_p2
+                else:
+                    # ── SINGLE-PASS INFERENCE ──
+                    timesteps = torch.ones(1, total_tokens, device=device, dtype=dtype)
+                    video_mod = Modality(
+                        enabled=True, latent=z, sigma=sigma_val,
+                        timesteps=timesteps, positions=positions,
+                        context=prompt_embeds, context_mask=prompt_mask,
+                    )
+                    v_pred, _ = transformer(video=video_mod, audio=None, perturbations=None)
+                    x_out = z - v_pred
             else:
                 time_steps_sched = torch.linspace(1.0, 0.0, args.num_steps + 1, device=device)
                 x_out = z
@@ -433,12 +505,25 @@ def main():
             chunk_seed = args.seed + chunk_idx
             t_chunk = time.perf_counter()
 
-            x_tokens = generate_one_chunk(chunk_seed)
+            if ensemble_k > 1:
+                # Multi-path ensemble: K different noise samples, average predictions
+                ensemble_outputs = []
+                for ek in range(ensemble_k):
+                    x_k = generate_one_chunk(chunk_seed * 1000 + ek)
+                    ensemble_outputs.append(x_k)
+                # Average in token space (before unpatchify)
+                x_tokens = torch.stack(ensemble_outputs).mean(dim=0)
+            else:
+                x_tokens = generate_one_chunk(chunk_seed)
+
             x_latent = unpatchify_latent(x_tokens)
             all_latents.append(x_latent)
 
             dit_ms = (time.perf_counter() - t_chunk) * 1000
-            print(f"  Chunk {chunk_idx+1}/{num_chunks}: DiT={dit_ms:.0f}ms")
+            mode = "2-pass" if args.two_pass else "1-pass"
+            if ensemble_k > 1:
+                mode += f", K={ensemble_k}"
+            print(f"  Chunk {chunk_idx+1}/{num_chunks}: DiT={dit_ms:.0f}ms ({mode})")
 
         # Decode all chunks
         for chunk_idx, x_latent in enumerate(all_latents):

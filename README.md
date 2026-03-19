@@ -1,35 +1,153 @@
-# CastleHill: Separable Causal Diffusion for LTX-2
+# CastleHill: SCD + VFM for LTX-2
 
-**CastleHill** adds Separable Causal Diffusion (SCD) to [Lightricks/LTX-2](https://github.com/Lightricks/LTX-2) for long-form video generation (30s+) on consumer GPUs.
+**CastleHill** extends [Lightricks/LTX-2](https://github.com/Lightricks/LTX-2) with **1-step video generation** (VFM) and **long-form streaming** (SCD).
 
-SCD splits LTX-2's 48-layer DiT into an **encoder** (32 layers, run once per frame with KV-cache) and a **decoder** (16 layers, run N denoising steps per frame). This enables autoregressive generation — each new frame conditions on all previous frames via cached encoder features.
+**Key results:**
+- **0.5s generation** for 9 frames (vs 4s baseline 8-step) on RTX 5090
+- **8x faster** than standard LTX-2 inference
+- **Distribution-level training** via Self-E + adversarial DMD
 
-## CastleHill Additions
+## Experiment Network Graph
 
-| Component | Location | Description |
-|-----------|----------|-------------|
-| `scd_model.py` | `ltx-core/.../transformer/` | SCD encoder/decoder wrapper |
-| `ddit.py` | `ltx-core/.../transformer/` | DDiT dynamic patch scheduling (optional) |
-| `scd_strategy.py` | `ltx-trainer/.../training_strategies/` | SCD training strategy |
-| `scd_inference.py` | `ltx-trainer/scripts/` | Autoregressive inference |
-| `bezierflow/` | `ltx-trainer/src/ltx_trainer/` | Learned sigma scheduler |
-| `ltx2_scd_*.yaml` | `ltx-trainer/configs/` | Training configurations |
+```
+LTX-2 (22B DiT, Lightricks)
+    |
+    +-- SCD (Separable Causal Diffusion)
+    |   |   Split 48-layer DiT into encoder(32) + decoder(16)
+    |   |   KV-cache for autoregressive streaming (30s+ video)
+    |   +-- docs/scd-achievements.md
+    |
+    +-- VFM (Variational Flow Maps) ---- 1-step video generation
+        |
+        +-- v1a  Baseline MLP adapter + Gaussian noise
+        |
+        +-- v1b  Transformer adapter (cross-attn to text, 38M params)
+        |
+        +-- v1d  + Per-token sigma (SigmaHead predicts per-token noise level)
+        |         + Trajectory distillation (8-step ODE precomputed)
+        |
+        +-- v1f  + Spherical Cauchy noise (direction-magnitude on S^127)  <-- VALIDATED
+        |   |      + Anti-collapse: obs_loss=25, mu_align=5, diversity
+        |   |      + W&B: https://wandb.ai/snoozie/vfm-v1f
+        |   |
+        |   +-- v1f anticollapse (LTX-2.3 22B, 5K dataset)
+        |       W&B: https://wandb.ai/snoozie/vfm-v1f/runs/kxks35j8
+        |
+        +-- v3a  DMD2 Adversarial (GAN discriminator in noisy latent space)
+        |   |    + LatentDiscriminator (18M params, register tokens)
+        |   |    + Flow Distribution Matching (SpatialHead, DiagDistill)
+        |   |    + W&B: https://wandb.ai/snoozie/vfm-v3a
+        |   |
+        |   +-- v3a overfit-10 (proof of concept)
+        |       W&B: https://wandb.ai/snoozie/vfm-v3a/runs/ev21ymgl
+        |
+        +-- v3b  Self-E (Self-Evaluating Model) ---- MOST PROMISING  <--
+            |    No discriminator! Model evaluates own outputs via
+            |    conditional vs unconditional classifier score.
+            |    + Latent perceptual loss (multi-scale cosine + L1)
+            |    + obs_loss + mu_align + diversity (from v1f)
+            |    + Energy-preserving normalization
+            |    + W&B: https://wandb.ai/snoozie/vfm-v3b
+            |
+            +-- v3b overfit-10 (converged, loss_data=0.04)
+            |   W&B: https://wandb.ai/snoozie/vfm-v3b/runs/hvrpf0ed
+            |   W&B: https://wandb.ai/snoozie/vfm-v3b/runs/ib67nuyf
+            |
+            +-- v3b 5K dataset (scaling from overfit)
+            |   W&B: https://wandb.ai/snoozie/vfm-v3b/runs/kyubxb40
+            |
+            +-- v3b 5K + obs_loss (CURRENT, all losses at 100%)
+                W&B: https://wandb.ai/snoozie/vfm-v3b/runs/cgxdj1g6
 
-## SCD Quick Start
-
-```bash
-# Train SCD LoRA (token_concat + per-frame decoder)
-uv run python packages/ltx-trainer/scripts/train.py packages/ltx-trainer/configs/ltx2_scd_ditto.yaml
-
-# Generate 30s video
-python packages/ltx-trainer/scripts/scd_inference.py \
-    --cached-embedding /path/to/conditions_final/000.pt \
-    --num-seconds 30 --quantization int8-quanto \
-    --decoder-combine token_concat \
-    --output output.mp4
+    Explored & Rejected:
+        x-- v1e  Content-adaptive routing (unvalidated complexity)
+        x-- v1g  HyperSphereDiff (too many fighting loss terms)
+        x-- v1h  Integrated adapter sigma (adapter can't encode x0 complexity)
+        x-- v2a  Speculative noise selection (unimodal, no diversity)
 ```
 
-See [docs/scd-achievements.md](docs/scd-achievements.md) for full SCD documentation and benchmarks.
+## Papers Implemented
+
+| Paper | What we took | Version |
+|-------|-------------|---------|
+| [VFM](https://arxiv.org/abs/2603.07276) (Mammadov 2026) | Noise adapter + flow map for 1-step | v1a-v1f |
+| [Self-Flow](https://arxiv.org/abs/2603.06507) | Per-token timestep scheduling | v1d+ |
+| [Self-E](https://arxiv.org/abs/2512.22374) (Yu 2025) | Self-evaluating distillation (no discriminator) | **v3b** |
+| [DMD2](https://arxiv.org/abs/2405.14867) (Yin 2024) | GAN in noisy latent space | v3a |
+| [FlashMotion](https://arxiv.org/abs/2603.12146) (CVPR 2026) | Adversarial post-training for video | v3a |
+| [DiagDistill](https://arxiv.org/abs/2603.09488) (ICLR 2026) | Flow Distribution Matching + SpatialHead | v3a flow loss |
+| [OmniForcing](https://arxiv.org/abs/2603.11647) | Audio Sink Tokens, Joint Self-Forcing | Planned (SCD+audio) |
+| [Chain-of-Steps](https://arxiv.org/abs/2603.16870) | Multi-path ensemble at inference | `--ensemble K` flag |
+
+## Measured Inference Speed (RTX 5090, int8-quanto)
+
+| Method | DiT passes | Wall clock | Speedup |
+|--------|-----------|------------|---------|
+| LTX-2 8-step baseline | 8 | ~4.0s | 1x |
+| **VFM 1-step** | **1** | **0.5s** | **8x** |
+| VFM 2-pass (SigmaHead) | 2 | ~1.0s | 4x |
+| VFM ensemble K=3 | 3 | ~1.5s | 2.7x |
+
+## Architecture (v3b — Current Best)
+
+```
+Text prompt -> Gemma -> Connector (3840->4096)
+                           |
+                    NoiseAdapterV1b (38M)
+                    Spherical Cauchy: mu, kappa
+                           |
+                    z ~ q_phi(z|text)
+                           |
+                    DiT 22B (LoRA r=32) -- 1 forward pass
+                           |
+                    x_hat_0 = z - v_pred
+                           |
+            +-------+------+------+--------+
+            |       |      |      |        |
+         data_loss  obs  self-E  percept  mu_align
+         |x-x0|^2  noisy  cond   multi   cos(mu,x0)
+                    recon  vs     scale
+                           uncond
+```
+
+## Quick Start
+
+```bash
+# Train VFM v3b (Self-E, 1-step generation)
+uv run python packages/ltx-trainer/scripts/train.py \
+    packages/ltx-trainer/configs/ltx2_vfm_v3b_self_e_5k_obs.yaml
+
+# Inference (1-step, 0.5s per clip)
+python packages/ltx-trainer/scripts/vfm_vanilla_inference.py \
+    --adapter-path checkpoints/noise_adapter_step_10000.safetensors \
+    --lora-path checkpoints/lora_weights_step_10000.safetensors \
+    --cached-embedding data/conditions_final/000000.pt \
+    --adapter-variant v1b --output output.mp4
+
+# Two-pass inference (sharper, 1.0s)
+python scripts/vfm_vanilla_inference.py ... --two-pass
+
+# Ensemble inference (3 reasoning paths, 1.5s)
+python scripts/vfm_vanilla_inference.py ... --ensemble 3
+```
+
+## Roadmap
+
+- **v3b + 5K dataset** (in progress) - Scale from overfit to diverse prompts
+- **v3b + Audio** - OmniForcing Audio Sink Tokens + Identity RoPE
+- **SCD + VFM** - 1-step decoder per chunk for real-time streaming at 25 FPS
+- **Diagonal Denoising** - Progressive step reduction (5->4->3->2 per chunk)
+- **CliffordVideoAttention** - Geometric sparse attention (17x fewer self-attn FLOPs)
+
+## Documentation
+
+| Doc | Contents |
+|-----|----------|
+| [docs/VFM.md](docs/VFM.md) | VFM adapter versions v1a-v3b, architecture, losses |
+| [docs/v3b-architecture.md](docs/v3b-architecture.md) | v3b Self-E state diagram, papers, weaknesses |
+| [docs/scd-achievements.md](docs/scd-achievements.md) | SCD architecture, benchmarks, training runs |
+
+See [docs/scd-achievements.md](docs/scd-achievements.md) for SCD documentation.
 
 ---
 
