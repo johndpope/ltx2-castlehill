@@ -115,6 +115,7 @@ def vfm_sample(
     num_frames: int,
     num_steps: int = 1,
     temperature: float = 1.0,
+    sigma_head: nn.Module | None = None,
 ) -> Tensor:
     """VFM multi-step conditional sampling (Algorithm 1 from paper).
 
@@ -130,6 +131,9 @@ def vfm_sample(
         num_frames: Number of video frames
         num_steps: Number of sampling steps (K in Algorithm 1)
         temperature: Noise sampling temperature
+        sigma_head: Optional per-token sigma predictor. If provided, uses
+            SigmaHead output as per-token timesteps instead of uniform t=1.0.
+            This matches training when per_token_sigma=True.
 
     Returns:
         Generated video latents [B, seq_len, C]
@@ -166,18 +170,24 @@ def vfm_sample(
 
     # === Step 2: Sample structured noise from adapter ===
     # Algorithm 1, line 3: z ← μφ(y,c) + σφ(y,c) ⊙ ε
-    z = noise_adapter.sample(
+    z, adapter_mu = noise_adapter.sample_with_mu(
         encoder_features=shifted_features,
         task_class=task_class,
         temperature=temperature,
     )
 
+    # === Step 2b: Per-token timesteps from SigmaHead (if available) ===
+    if sigma_head is not None and adapter_mu is not None:
+        per_token_sigmas = sigma_head(adapter_mu.float())  # [B, seq]
+        # First frame conditioning tokens get σ=0
+        per_token_sigmas[:, :tokens_per_frame] = 0.0
+        timesteps = per_token_sigmas.to(dtype)
+    else:
+        timesteps = torch.ones(B, seq_len, device=device, dtype=dtype)
+
     # === Step 3: One-step or multi-step decode ===
     if num_steps == 1:
         # One-step: direct flow map evaluation
-        # Create decoder input at t=1 (full noise)
-        timesteps = torch.ones(B, seq_len, device=device, dtype=dtype)
-
         decoder_modality = Modality(
             enabled=True,
             latent=z,
@@ -208,12 +218,16 @@ def vfm_sample(
             t_km1 = time_steps[k + 1]
             dt = t_km1 - t_k  # Negative (going from 1 to 0)
 
-            timesteps = torch.full((B, seq_len), t_k.item(), device=device, dtype=dtype)
+            # Scale per-token timesteps for this step
+            if sigma_head is not None:
+                step_timesteps = timesteps * t_k  # Scale down per token
+            else:
+                step_timesteps = torch.full((B, seq_len), t_k.item(), device=device, dtype=dtype)
 
             decoder_modality = Modality(
                 enabled=True,
                 latent=x,
-                timesteps=timesteps,
+                timesteps=step_timesteps,
                 positions=video_positions,
                 context=video_prompt_embeds,
                 context_mask=prompt_attention_mask,

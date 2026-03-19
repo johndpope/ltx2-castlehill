@@ -21,30 +21,86 @@
 
 When working on this project, **eagerly anticipate** the user's goals and suggest concrete next steps. Always consider:
 
-### Architecture Iterations to Explore
-- ✅ **Trajectory distillation** (v1d): Pre-computed teacher 8-step ODE paths. Implemented in `precompute_trajectories.py` + `vfm_strategy_v1d.py`.
-- ✅ **Per-token timestep scheduling** (v1d): SigmaHead MLP predicts per-token σ from adapter μ. Inspired by Self-Flow (arxiv:2603.06507).
-- ✅ **Content-adaptive routing** (v1e): ContentRouter predicts per-token complexity, guides sigma + loss weighting. Inspired by EVATok (arxiv:2603.12267).
-- ✅ **Frequency detail preservation** (v1e): Spatial gradient matching loss for edge/texture quality.
-- **Consistency distillation (rCM)**: NVIDIA's approach scales to 10B+ video models. 2-4 step generation with high quality.
-- **Adversarial post-training**: Add discriminator loss after initial VFM training for sharper outputs (DAPT approach).
-- **Resolution/batch tradeoffs**: Smaller latents (e.g., 512x320) enable higher batch sizes.
-- **EMA teacher**: Use EMA of the flow map as a slowly-improving teacher for self-distillation.
+### Architecture Iterations — Completed
+- ✅ **Trajectory distillation** (v1d): Pre-computed teacher 8-step ODE paths. Implemented but creates σ mismatch with per-token sigma — use `distill_mode: "none"` when per_token_sigma is enabled.
+- ✅ **Per-token timestep scheduling** (v1d→v1f): SigmaHead MLP predicts per-token σ. **Must take x₀ as input** (not just adapter_mu) — adapter features can't encode content complexity. Complexity-aware targets from x₀ replace global mean pull.
+- ✅ **Spherical Cauchy noise** (v1f): Direction-magnitude decomposition of adapter noise on S^127. Working baseline with sharp reconstructions.
+- ✅ **SLERP geodesic interpolation** (v1f option): `use_slerp_interp: true` — geodesic path through latent space. Code ready, needs A/B testing.
+- ❌ **Integrated adapter sigma** (v1h): Tried adding σ output head to adapter — collapses because adapter features (text+position) can't encode x₀ content complexity. Keep SigmaHead separate.
+- ❌ **Speculative noise selection** (v2a): K candidates from same distribution are nearly identical (unimodal Cauchy, κ≈4). Score spread ~0.01. +16% cost for no quality gain.
+- ❌ **Content-adaptive routing** (v1e): Added complexity but not validated before stacking.
+- ❌ **v1g HyperSphereDiff losses**: Over-engineered — too many loss terms fighting each other.
+
+### Architecture Iterations — In Progress
+- ✅ **v3a DMD2 Adversarial Distribution Matching** (active): GAN discriminator in noisy latent space (DMD2/FlashMotion) + Flow Distribution Matching with SpatialHead (DiagDistill). LoRA rank 32. Discriminator: 18M-param latent transformer with register tokens. SpatialHead: 178K-param separable conv with confidence prediction. No teacher ODE needed at training time — uses GT x₀ as real distribution. Precomputed 8-step trajectories available at `trajectories/` dir. W&B project: `vfm-v3a`.
+- ✅ **CliffordVideoAttention** (tested): Geometric sparse attention with rolling spatial/temporal/channel shifts. 48 blocks swapped post-load. Trains on standard text-to-video. Tested on 3090 (hp-z6).
+
+### Architecture Iterations — Next (ordered by expected impact)
+- **v3a + Audio**: Add audio branch to v3a with OmniForcing's Audio Sink Tokens + Identity RoPE stabilizer. Discriminator already supports text conditioning — extend to audio conditioning.
+- **v3b Joint Self-Forcing**: OmniForcing Eq. 9 — train with model's own autoregressive outputs as KV context (fixes exposure bias for SCD streaming).
+- **Diagonal Denoising** (DiagDistill): Progressive step reduction for SCD chunks (5→4→3→2→2 steps). Maps directly to SCD encoder-decoder architecture.
+- **v2b Multi-Resolution Speculative Training** (SSD #3): Same noise z at K sigma levels [1.0, 0.7, 0.5, 0.3] in ONE batched DiT pass. K× training signal for <2× cost. Consistency loss across ODE paths. See [docs/SSD.md](docs/SSD.md).
+- **Async Adapter-DiT Pipeline** (SSD #5): CUDA streams to hide adapter latency. ~4% free speedup.
+
+### GPU Layout (msi workstation)
+**WARNING: nvidia-smi and PyTorch REVERSE the GPU indices!**
+| nvidia-smi | PyTorch | GPU | VRAM | Role |
+|------------|---------|-----|------|------|
+| GPU 0 | cuda:1 | RTX PRO 4000 Blackwell | 24GB | VAE, text encoder |
+| GPU 1 | cuda:0 | RTX 5090 | 32GB | Transformer (training) |
+
+Always use **PyTorch indices** in config files:
+```yaml
+hardware:
+  devices:
+    transformer: "cuda:0"      # RTX 5090 32GB
+    vae_decoder: "cuda:1"      # RTX PRO 4000 24GB
+    vae_encoder: "cuda:1"
+```
+
+### Grok MCP Integration
+When using the Grok MCP tool for research/architecture questions:
+- **Always reuse the existing session ID** to maintain conversation continuity
+- **Be maximally verbose** — include full file contents, code snippets, training results, W&B links
+- **Attach context** via `grok_add_context` before asking questions — Grok has no access to our codebase
+- **Include concrete numbers**: loss values, VRAM usage, step counts, model sizes
+- The current session ID should be stored and reused across the conversation
+
+### Hard-Won Lessons (DO NOT repeat these mistakes)
+1. **KL weight**: Start at 0.001, not 0.1 or 3.0. Spherical KL with clamped kappa creates a constant floor (~14.8) that dominates flow matching loss at any weight >0.01.
+2. **SigmaHead must see x₀**: The adapter's text+position features CANNOT encode content complexity. SigmaHead(adapter_mu) → flat sigma. SigmaHead(x₀, adapter_mu) → spatial variation.
+3. **Don't use distill_mode with per-token sigma**: Creates timestep mismatch — model sees pure noise but sigma says otherwise.
+4. **Never stack features on unvalidated architecture**: Prove each addition works in isolation before combining (v1g lesson).
+5. **Override minimally**: When adding to a strategy, override the smallest possible method. v2a broke reconstructions by overriding `_prepare_standard_inputs` — fixed by overriding only `_sample_spherical_noise`.
+6. **Sigma collapse directions**: With interpolation, learned σ collapses to σ_min (easier MSE). Detaching σ from MSE causes swing to σ_max. Use complexity targets from x₀ as the gradient source.
+7. **Evaluate before scaling**: Always overfit 10 samples first. Check loss_mf decreasing AND reconstruction_video sharpness in W&B before launching 5K runs.
+8. **No separate fake score network for DMD**: DMD1's approach (19B fake scorer) is impractical. DMD2/FlashMotion use a lightweight discriminator (~18M) in noisy latent space — same quality, 1000x fewer params.
+9. **Precomputed trajectories are reusable**: The `trajectories/` dir (8-step ODE states) contains teacher outputs. Don't recompute — `states[-1]` = teacher denoised output, `x0_gt` = ground truth.
+10. **GT x₀ IS the real distribution**: For discriminator training, use ground truth x₀ as "real" — no teacher ODE needed. Teacher ODE output ≠ data distribution (it's the teacher's approximation).
 
 ### Training Strategy Checklist
 Before scaling any experiment:
-1. Does it overfit 1 sample? (sanity check)
-2. Does adapter μ vary across tokens/samples? (if identical → not learning)
-3. Is σ staying above 0.3? (if collapsing → mode collapse)
-4. Are diversity metrics (temporal_std, spatial_std) increasing? (v1c+)
+1. Does it overfit 10 samples? (loss_mf → <0.1, sharp reconstruction_video)
+2. Does adapter μ vary across tokens/samples? (if mu_norm_mean ≈ 0 → not learning)
+3. Is σ spatially varying? (sigma_std > 0.1, check sigma_heatmap)
+4. Is KL < 10% of total loss? (if dominant → reduce kl_weight)
 5. Does 1-step output look better than random noise? (visual check)
 
+### Proactive Behavior — ALWAYS suggest next steps
+After completing any task, **eagerly suggest** the next evolution:
+- **After implementing a new version** → "Run overfit sanity check. If sharp, scale to 5K overnight. Then consider [next technique from roadmap]."
+- **After a training run completes** → Analyze metrics, flag issues, suggest parameter adjustments or next experiment.
+- **After fixing a bug** → "This fix also applies to [other versions]. Want me to propagate?"
+- **When loss plateaus** → Check loss balance (KL vs MSE), suggest weight adjustments, propose architectural changes.
+- **When reconstruction is blurry** → Check: (1) input mismatch (pure noise vs interpolation), (2) KL dominating, (3) sigma collapsed, (4) parent chain broken.
+
 ### When User Asks About...
-- **Training speed** → suggest smaller resolution, higher batch, gradient accumulation tradeoffs
-- **Quality** → suggest trajectory distillation, adversarial fine-tuning, more training data
+- **Training speed** → suggest smaller resolution, higher batch, gradient accumulation, velocity cache, async pipeline
+- **Quality** → suggest multi-resolution speculative, adversarial fine-tuning, more training data
 - **New papers** → evaluate relevance to VFM/SCD, flag if per-token timesteps, noise structure, or distillation
 - **Scaling data** → check preprocessing pipeline, estimate encode time, suggest parallel GPU usage
 - **Inference speed** → benchmark against Desktop times, suggest quantization (fp8-quanto on Blackwell)
+- **What's next?** → refer to Architecture Iterations — Next list, suggest the top item with implementation plan
 
 ## Package Structure
 
@@ -136,19 +192,12 @@ uv run ruff check .
 uv run pytest
 ```
 
-## SCD Architecture
+## Detailed Documentation
 
-```
-Frame N generation:
+| Doc | Contents |
+|-----|----------|
+| **[docs/VFM.md](docs/VFM.md)** | VFM adapter versions v1a→v1e, architecture, loss functions, W&B links, papers |
+| **[docs/scd-achievements.md](docs/scd-achievements.md)** | SCD architecture, benchmarks, training runs, technical discoveries |
+| **[docs/gFFN-HRR-whitepaper.md](docs/gFFN-HRR-whitepaper.md)** | gFFN-HRR FFN optimization research |
 
-ENCODER (32 layers, once per frame, KV-cached):
-  Frame N-1 (clean, σ=0) → [32 blocks] → encoder_features
-                              KV-cache grows across frames
-
-DECODER (16 layers, N_steps per frame):
-  token_concat(encoder_features, noisy_frame_N) → [16 blocks] → velocity
-```
-
-- **Encoder**: O(1) per frame via KV-cache (~6% of total time)
-- **Decoder**: Linear scaling with frame count (~1.3-1.7s/frame)
-- **DDiT** (optional): 4× fewer tokens in decoder → 1.25-1.48× speedup
+> **RULE:** When modifying VFM, SCD, or benchmark code, update the corresponding doc above.

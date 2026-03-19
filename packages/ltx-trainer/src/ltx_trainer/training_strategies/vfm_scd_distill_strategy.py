@@ -188,6 +188,7 @@ class VFMSCDDistillStrategy(VFMSCDTrainingStrategy):
         encoder_timesteps = torch.zeros(batch_size, video_seq_len, device=device, dtype=dtype)
         encoder_modality = Modality(
             enabled=True,
+            sigma=torch.zeros(batch_size, device=device, dtype=dtype),
             latent=video_latents,
             timesteps=encoder_timesteps,
             positions=video_positions,
@@ -314,6 +315,7 @@ class VFMSCDDistillStrategy(VFMSCDTrainingStrategy):
 
         decoder_modality = Modality(
             enabled=True,
+            sigma=sigmas.squeeze(),
             latent=noisy_video,
             timesteps=decoder_timesteps,
             positions=video_positions,

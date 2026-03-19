@@ -119,6 +119,11 @@ uv run python scripts/train.py configs/ltx2_vfm_v1d_distill.yaml
 
 **Observation:** Quality deteriorates on detailed/complex content around step 458. Simple regions reconstruct fine but textures/edges lose quality. This motivated v1e.
 
+**Training issues found:**
+- `.detach()` on sigma head input cut gradient → sigma head couldn't learn. Fix: remove `.detach()`.
+- `kl_free_bits: 0.25` too high → KL floored to 0, no gradient on adapter. Fix: reduce to 0.05.
+- `alpha: 0.5` → adapter noise used only 50% of steps. Fix: increase to 0.8.
+
 ---
 
 ### v1e — Content-Adaptive Router + Detail Preservation (`vfm_strategy_v1e.py`)
@@ -153,6 +158,61 @@ v1e:     complex regions → lower σ (continuous allocation in noise space)
 
 ---
 
+### v1f — Spherical Cauchy Noise Adapter (`vfm_strategy_v1f.py`)
+
+**Architecture:** v1d + Spherical Cauchy noise distribution on S^127 (replaces Gaussian reparameterization).
+
+| Component | Detail |
+|-----------|--------|
+| Noise distribution | Spherical Cauchy on S^127 (heavy-tailed, geodesic structure) |
+| Direction-magnitude decomposition | μ̂ = normalize(μ) → direction, r = ‖μ‖ → magnitude, κ = exp(mean(log_σ)) → concentration |
+| Sampling | `z = r · SphericalCauchy(μ̂, κ)` instead of `z = μ + σ·ε` |
+| Spherical KL | `KL = (D-1)/2 · [log(κ) - log(1+κ)]` — clean closed form, replaces Gaussian KL |
+| Kappa regularization | Pull mean κ toward target (>1.0) + entropy for per-token κ diversity |
+| Magnitude regularization | MSE(‖μ‖, target) prevents noise scale collapse |
+| Geodesic diversity metric | Mean pairwise angular distance between adapter directions on S^127 |
+| W&B logging | κ heatmap + ‖μ‖ heatmap per frame, sigma heatmap, reconstruction videos |
+
+**Why Spherical Cauchy?** The adapter must learn a *structured noise manifold* — not all noise directions are useful for 1-step generation. Spherical Cauchy provides:
+
+1. **Heavy tails** — broader exploration early in training, discovering useful noise directions faster than Gaussian (20-30% faster convergence per spherical-vae benchmarks)
+2. **Direction-magnitude separation** — independently learns *what kind of noise* (direction on S^127) vs *how much noise* (magnitude). Gaussian entangles these.
+3. **Per-token concentration (κ)** — precise tokens (faces, edges) get high κ (peaked sampling around learned direction), imprecise tokens (sky, flat regions) get low κ (any direction works)
+4. **Geodesic structure** — angular distance between noise directions is meaningful and measurable. Diversity can be quantified as angular spread on the hypersphere.
+
+**Key insight:** The NoiseAdapterV1b architecture is unchanged — v1f just reinterprets its (μ, log_σ) outputs geometrically. This means weights transfer from v1d checkpoints.
+
+```
+Gaussian (v1d):          z = μ + σ·ε,  ε ~ N(0,I)     (unbounded R^128)
+Spherical Cauchy (v1f):  z = ‖μ‖ · SpCauchy(μ̂, κ)     (direction on S^127 × magnitude)
+```
+
+**Training pipeline:**
+```bash
+# Sanity check (no distillation)
+uv run python scripts/train.py configs/ltx2_vfm_v1f_spherical.yaml
+
+# Key wandb metrics to watch:
+#   vfm/kappa_mean — should rise above 1.0 (kappa_pull drives this)
+#   vfm/kappa_std — should increase (kappa_entropy drives this)
+#   vfm/mu_norm_mean — should converge near target_magnitude (1.0)
+#   vfm/geodesic_diversity — angular spread in radians (higher = more diverse)
+#   vfm/loss_kl — activates when κ > 1.0 (below 1.0 → free KL, no gradient)
+```
+
+**Training observations (run jwi1hbkp):**
+- loss_mf drops 10x in 130 steps (0.21 → 0.02)
+- Geodesic diversity reaches 1.35 rad (~77°) — adapter directions well-spread
+- κ collapses to floor when no kappa regularization → added kappa_pull and kappa_entropy losses
+- Sigma head starts learning after warmup (step 200+): sigma_std 0.000008 → 0.024
+- KL stays at 0 until κ > 1.0 — this is by design (free exploration phase)
+
+**Inspired by:** [Spherical Cauchy distribution](https://github.com/johndpope/spherical-vae) for variational sampling on hyperspheres.
+
+**Utility module:** `src/ltx_trainer/spherical_utils.py` — sampling, KL, SLERP, geodesic distance.
+
+---
+
 ## Training Data
 
 | Dataset | Location | Samples | Status |
@@ -171,9 +231,35 @@ v1e:     complex regions → lower σ (continuous allocation in noise space)
 |--------|---------|
 | `precompute_trajectories.py` | 8-step ODE trajectories for base 48-layer model |
 | `precompute_scd_trajectories.py` | SCD decoder trajectories (16-layer) |
+| `vfm_benchmark.py` | VFM speed vs LTX Desktop 8-step (all resolutions) |
 | `train_bezierflow_base.py` | Learned sigma schedule (abandoned — linear is better) |
 | `benchmark_schedule.py` | A/B comparison of sigma schedules |
 | `scd_inference.py` | Autoregressive SCD inference |
+
+---
+
+## Benchmark: VFM vs LTX Desktop
+
+VFM 1-step is benchmarked against LTX Desktop 8-step (RTX 5090, i2v, without text encoding):
+
+```bash
+uv run python scripts/vfm_benchmark.py \
+    --adapter-path checkpoints/noise_adapter_step_XXXXX.safetensors \
+    --lora-path checkpoints/lora_weights_step_XXXXX.safetensors \
+    --cached-embedding /media/12TB/ddit_ditto_data/conditions_final/000000.pt
+```
+
+**LTX Desktop 8-step reference times** (RTX 5090):
+
+| Config | Desktop 8-step |
+|--------|---------------|
+| 5s 540p | ~33s |
+| 5s 720p | ~42s |
+| 5s 1080p | ~76s |
+| 10s 540p | ~44s |
+| 20s 540p | ~73s |
+
+**VFM theoretical speedup**: 8x fewer transformer forward passes. Actual speedup depends on adapter overhead (~1-5% of total) and VAE decode time (constant). Expected: **6-21x** depending on resolution/duration.
 
 ---
 
@@ -185,6 +271,7 @@ v1e:     complex regions → lower σ (continuous allocation in noise space)
 | [Self-Flow](https://arxiv.org/abs/2603.06507) | Per-token timestep scheduling, dual-σ approach | v1d sigma head |
 | [HiAR](https://arxiv.org/abs/2603.08703) | Forward-KL diversity regularization for mode collapse prevention | v1c diversity loss |
 | [EVATok](https://arxiv.org/abs/2603.12267) | Content-adaptive token allocation via router network | v1e content router |
+| [Spherical Cauchy](https://github.com/johndpope/spherical-vae) | Heavy-tailed distribution on hypersphere, direction-magnitude decomposition | v1f noise sampling |
 | [Min-SNR](https://arxiv.org/abs/2303.09556) | Timestep-weighted loss for reduced variance | All versions |
 | [SCD](https://arxiv.org/abs/2602.10095) | Separable causal diffusion for long-form video | SCD strategy |
 
@@ -194,16 +281,22 @@ v1e:     complex regions → lower σ (continuous allocation in noise space)
 
 ```bash
 # 1. Overfit sanity check (no trajectories needed, ~15 min)
-uv run python scripts/train.py configs/ltx2_vfm_v1e_overfit_1sample.yaml
+uv run python scripts/train.py configs/ltx2_vfm_v1d_overfit_1sample.yaml
 
 # 2. Full distillation training (needs trajectories)
 uv run python scripts/train.py configs/ltx2_vfm_v1d_distill.yaml
 
-# 3. Check wandb for:
+# 3. Spherical Cauchy noise (v1f)
+uv run python scripts/train.py configs/ltx2_vfm_v1f_spherical.yaml
+
+# 4. Check wandb for:
 #    - vfm/loss_mf should decrease
 #    - vfm/adapter_mu_mean should vary (not stuck at 0)
 #    - vfm/sigma_mean should be diverse (not all 0.5)
+#    - vfm/kappa_mean should rise above 1.0 (v1f)
+#    - vfm/geodesic_diversity should increase (v1f)
 #    - train/reconstruction_video at log intervals
+#    - train/spherical_heatmap (v1f) shows κ and ||μ|| per frame
 #    - train/complexity_heatmap (v1e) should show edges highlighted
 ```
 
@@ -215,7 +308,7 @@ All VFM strategies share common config fields from `VFMTrainingConfig`:
 
 ```yaml
 training_strategy:
-  name: "vfm_v1e"           # v1a="vfm", v1b="vfm_v1b", v1c="vfm_v1c", v1d="vfm_v1d", v1e="vfm_v1e"
+  name: "vfm_v1f"           # v1a="vfm", v1b="vfm_v1b", v1c="vfm_v1c", v1d="vfm_v1d", v1e="vfm_v1e", v1f="vfm_v1f"
 
   # Noise adapter
   alpha: 0.5                 # P(use adapter noise) vs P(standard N(0,I))
@@ -253,6 +346,17 @@ training_strategy:
   complexity_loss_weight: 0.5
   frequency_loss_weight: 0.05
   router_supervision: true
+
+  # v1f spherical cauchy
+  spherical_noise: true
+  kappa_min: 0.1
+  kappa_max: 50.0
+  kappa_target: 2.0              # Pull κ above 1.0 so KL activates
+  kappa_pull_weight: 0.05        # Strength of κ → target pull
+  kappa_entropy_weight: 0.01     # Encourage per-token κ diversity
+  magnitude_reg_weight: 0.01     # Keep ||μ|| near target
+  target_magnitude: 1.0
+  use_slerp_interp: false        # Experimental: SLERP instead of linear interp
 ```
 
 ---
@@ -273,17 +377,19 @@ training_strategy:
                                │ μ, log_σ [B, 1344, 128]
                     ┌──────────▼──────────┐
                     │  Reparameterize      │
-                    │  z = μ + σ·ε         │
+                    │  v1d: z = μ + σ·ε    │
+                    │  v1f: z = ‖μ‖·SC(μ̂,κ)│  ← Spherical Cauchy
                     └──────────┬──────────┘
                                │ z [B, 1344, 128]
                     ┌──────────▼──────────┐
-          ┌────────│  Content Router (v1e) │
-          │        │  1.6M params          │
+          ┌────────│  SigmaHead (v1d+)     │
+          │        │  or Router (v1e)      │
+          │        │  99K / 1.6M params    │
           │        └──────────┬───────────┘
-          │                   │ complexity [B, 1344]
+          │                   │ per-token σ_i [B, 1344]
           │        ┌──────────▼──────────┐
           │        │  Per-Token Sigma      │
-          │        │  σ_i = f(complexity)  │
+          │        │  σ_i = f(μ) or f(GT)  │
           │        └──────────┬───────────┘
           │                   │ σ [B, 1344]
           │        ┌──────────▼──────────┐
@@ -320,3 +426,6 @@ training_strategy:
 5. **Detailed content needs special handling** — uniform 1-step can't serve all tokens equally (→ v1e).
 6. **5000 trajectories is enough** — full teacher ODE paths give much stronger signal than random interpolation.
 7. **`torch.no_grad()` not `inference_mode()`** for caching — inference_mode tensors can't be used in autograd replay.
+8. **Never `.detach()` sigma head input** — cuts gradient from flow matching loss, sigma head can't learn which tokens need different noise levels.
+9. **Spherical Cauchy κ needs explicit pull above 1.0** — for D=128, any κ < 1 gives negative KL (more entropy than uniform on S^127), so KL=0 and no gradient flows. Add `kappa_pull` loss to push κ into the regime where KL is positive.
+10. **Direction-magnitude decomposition is free** — reinterpreting existing adapter outputs geometrically requires no architecture changes, and weights transfer from Gaussian checkpoints.

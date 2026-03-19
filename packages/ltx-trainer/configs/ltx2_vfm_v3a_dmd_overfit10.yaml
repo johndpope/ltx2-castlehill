@@ -1,0 +1,179 @@
+# =============================================================================
+# VFM v3a — DMD-VFM Distribution Matching Distillation (Overfit 10 samples)
+# =============================================================================
+# Novel architecture: Train noise adapter + 1-step flow map at DISTRIBUTION
+# level using DMD, not per-sample reconstruction (MSE).
+#
+# Three networks:
+#   1. Student DiT (LoRA rank 32, 1-step) — generates video from adapter noise
+#   2. Teacher DiT (same base, no LoRA, 8-step ODE) — defines target distribution
+#   3. FakeScoreNetwork (~50M params) — estimates score field for DMD loss
+#
+# The DMD loss minimizes KL(p_student || p_teacher) via learned score functions,
+# producing sharper outputs than per-sample MSE (which mode-averages).
+#
+# Success criteria:
+#   - loss_score decreases (fake score learning)
+#   - loss_dmd decreases (student matching teacher distribution)
+#   - 1-step inference sharper than v1f at same wall-clock time
+#
+# Usage:
+#   uv run python scripts/train.py configs/ltx2_vfm_v3a_dmd_overfit10.yaml
+# =============================================================================
+
+model:
+  model_path: "/media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_q"
+    - "to_v"
+
+training_strategy:
+  name: "vfm_v3a"
+
+  # === Adversarial DMD (discriminator) ===
+  gan_g_weight: 0.01             # Generator GAN loss weight
+  gan_d_weight: 1.0              # Discriminator loss weight (internal)
+  disc_update_ratio: 1           # Update disc every step
+  disc_gen_ratio: 5              # Generator GAN loss every 5 steps (FlashMotion default)
+  critic_t_min: 0.02             # Min critic timestep
+  critic_t_max: 0.98             # Max critic timestep
+  disc_lr: 2.0e-6                # Discriminator LR (FlashMotion default)
+  disc_hidden_dim: 512
+  disc_num_heads: 8
+  disc_num_layers: 4
+  disc_num_registers: 4
+
+  # === Flow Distribution Matching (temporal consistency) ===
+  flow_match_weight: 4.0         # DiagDistill default (λ_flow=4)
+
+  # === Reconstruction regularizer (decays) ===
+  recon_weight: 0.5              # Start with reconstruction, decay to 0
+  recon_decay_steps: 500         # Decay recon over 500 steps
+
+  # === Teacher ODE (unused — using GT x0 as real) ===
+  teacher_num_steps: 8
+
+  # === Spherical Cauchy (inherited from v1f) ===
+  spherical_noise: true
+  kappa_min: 1.0
+  kappa_max: 10.0
+  use_slerp_interp: false
+  magnitude_reg_weight: 0.0
+  target_magnitude: 1.0
+  kappa_entropy_weight: 0.0
+  kappa_target: 2.0
+  kappa_pull_weight: 0.0
+
+  # === Per-token sigma ===
+  per_token_sigma: true
+  sigma_min: 0.3
+  sigma_max: 1.0
+  sigma_head_hidden_dim: 256
+  sigma_entropy_weight: 0.0
+  sigma_mean_target: 0.7
+  sigma_mean_pull_weight: 0.0
+
+  # === No distillation (DMD replaces it) ===
+  distill_mode: "none"
+
+  # === v1b Adapter ===
+  adapter_variant: "transformer"
+  adapter_hidden_dim: 512
+  adapter_num_heads: 8
+  adapter_num_layers: 4
+  adapter_pos_dim: 256
+
+  # === VFM Loss (low weight — DMD is primary) ===
+  tau: 1.0
+  obs_noise_level: 0.2
+  alpha: 1.0
+  kl_weight: 0.0001
+  kl_free_bits: 0.1
+  obs_loss_weight: 5.0           # Lower than v1f (DMD handles quality)
+  adaptive_loss: true
+  ema_decay: 0.999
+  first_frame_conditioning_p: 0.0
+
+  # === Diversity ===
+  diversity_weight: 0.1
+  temporal_diversity_weight: 0.1
+  spatial_diversity_weight: 0.05
+  diversity_warmup_steps: 0
+
+  # === mu alignment (lower — DMD provides stronger signal) ===
+  mu_align_weight: 1.0
+  mu_align_warmup_steps: 0
+  freeze_dit_steps: 0
+
+  inverse_problem_weights:
+    i2v: 1.0
+
+  with_audio: false
+
+  log_reconstructions: true
+  reconstruction_log_interval: 50   # More frequent for overfit monitoring
+  log_vfm_metrics: true
+
+optimization:
+  learning_rate: 1.0e-4
+  adapter_learning_rate: 5.0e-4
+  steps: 1000
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 100
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+hardware:
+  devices:
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+data:
+  preprocessed_data_root: "/media/12TB/ddit_ditto_data_23_overfit10"
+  num_dataloader_workers: 0
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+checkpoints:
+  interval: 200
+  keep_last_n: 5
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "vfm-v3a"
+  entity: null
+  tags: ["vfm-v3a", "dmd", "overfit-10", "rank32", "ltx-2.3-22b"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/vfm_v3a_dmd_overfit10"

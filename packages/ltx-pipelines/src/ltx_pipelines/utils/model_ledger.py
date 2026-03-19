@@ -8,9 +8,12 @@ from ltx_core.loader.registry import DummyRegistry, Registry
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
 from ltx_core.model.audio_vae import (
     AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
+    AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
     VOCODER_COMFY_KEYS_FILTER,
     AudioDecoder,
     AudioDecoderConfigurator,
+    AudioEncoder,
+    AudioEncoderConfigurator,
     Vocoder,
     VocoderConfigurator,
 )
@@ -30,12 +33,15 @@ from ltx_core.model.video_vae import (
 )
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.text_encoders.gemma import (
-    AV_GEMMA_TEXT_ENCODER_KEY_OPS,
-    AVGemmaTextEncoderModel,
-    AVGemmaTextEncoderModelConfigurator,
+    EMBEDDINGS_PROCESSOR_KEY_OPS,
+    GEMMA_LLM_KEY_OPS,
+    GEMMA_MODEL_OPS,
+    EmbeddingsProcessor,
+    EmbeddingsProcessorConfigurator,
+    GemmaTextEncoder,
+    GemmaTextEncoderConfigurator,
     module_ops_from_gemma_root,
 )
-from ltx_core.text_encoders.gemma.encoders.av_encoder import GEMMA_MODEL_OPS
 from ltx_core.utils import find_matching_file
 
 
@@ -73,8 +79,8 @@ class ModelLedger:
         :meth:`spatial_upsampler` method becomes available; otherwise calling it raises
         a :class:`ValueError`.
     loras:
-        Optional collection of LoRA configurations (paths, strengths, and key operations)
-        that are applied on top of the base transformer weights when building the model.
+        Tuple of LoRA configurations (path, strength, sd_ops) applied on top of the base
+        transformer weights. Use ``()`` for none.
     registry:
         Optional :class:`Registry` instance for weight caching across builders.
         Defaults to :class:`DummyRegistry` which performs no cross-builder caching.
@@ -82,8 +88,9 @@ class ModelLedger:
         Optional :class:`QuantizationPolicy` controlling how transformer weights
         are stored and how matmul is executed. Defaults to None, which means no quantization.
     ### Creating Variants
-    Use :meth:`with_loras` to create a new ``ModelLedger`` instance that includes
-    additional LoRA configurations while sharing the same registry for weight caching.
+    Use :meth:`with_additional_loras` to create a new ``ModelLedger`` instance that
+    includes additional LoRA configurations or :meth:`with_loras` to replace existing
+    lora configurations while sharing the same registry for weight caching.
     """
 
     def __init__(
@@ -93,7 +100,7 @@ class ModelLedger:
         checkpoint_path: str | None = None,
         gemma_root_path: str | None = None,
         spatial_upsampler_path: str | None = None,
-        loras: LoraPathStrengthAndSDOps | None = None,
+        loras: tuple[LoraPathStrengthAndSDOps, ...] = (),
         registry: Registry | None = None,
         quantization: QuantizationPolicy | None = None,
     ):
@@ -102,7 +109,7 @@ class ModelLedger:
         self.checkpoint_path = checkpoint_path
         self.gemma_root_path = gemma_root_path
         self.spatial_upsampler_path = spatial_upsampler_path
-        self.loras = loras or ()
+        self.loras = loras
         self.registry = registry or DummyRegistry()
         self.quantization = quantization
         self.build_model_builders()
@@ -131,6 +138,13 @@ class ModelLedger:
                 registry=self.registry,
             )
 
+            self.audio_encoder_builder = Builder[AudioEncoder](
+                model_path=self.checkpoint_path,
+                model_class_configurator=AudioEncoderConfigurator,
+                model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+                registry=self.registry,
+            )
+
             self.audio_decoder_builder = Builder(
                 model_path=self.checkpoint_path,
                 model_class_configurator=AudioDecoderConfigurator,
@@ -145,15 +159,23 @@ class ModelLedger:
                 registry=self.registry,
             )
 
+            # Embeddings processor only needs the LTX checkpoint (no Gemma weights)
+            self.embeddings_processor_builder = Builder(
+                model_path=self.checkpoint_path,
+                model_class_configurator=EmbeddingsProcessorConfigurator,
+                model_sd_ops=EMBEDDINGS_PROCESSOR_KEY_OPS,
+                registry=self.registry,
+            )
+
             if self.gemma_root_path is not None:
                 module_ops = module_ops_from_gemma_root(self.gemma_root_path)
                 model_folder = find_matching_file(self.gemma_root_path, "model*.safetensors").parent
                 weight_paths = [str(p) for p in model_folder.rglob("*.safetensors")]
 
                 self.text_encoder_builder = Builder(
-                    model_path=(str(self.checkpoint_path), *weight_paths),
-                    model_class_configurator=AVGemmaTextEncoderModelConfigurator,
-                    model_sd_ops=AV_GEMMA_TEXT_ENCODER_KEY_OPS,
+                    model_path=tuple(weight_paths),
+                    model_class_configurator=GemmaTextEncoderConfigurator,
+                    model_sd_ops=GEMMA_LLM_KEY_OPS,
                     registry=self.registry,
                     module_ops=(GEMMA_MODEL_OPS, *module_ops),
                 )
@@ -171,14 +193,19 @@ class ModelLedger:
         else:
             return torch.device("cpu")
 
-    def with_loras(self, loras: LoraPathStrengthAndSDOps) -> "ModelLedger":
+    def with_additional_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> "ModelLedger":
+        """Add new lora configurations to the existing ones."""
+        return self.with_loras((*self.loras, *loras))
+
+    def with_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> "ModelLedger":
+        """Replace existing lora configurations with new ones."""
         return ModelLedger(
             dtype=self.dtype,
             device=self.device,
             checkpoint_path=self.checkpoint_path,
             gemma_root_path=self.gemma_root_path,
             spatial_upsampler_path=self.spatial_upsampler_path,
-            loras=(*self.loras, *loras),
+            loras=loras,
             registry=self.registry,
             quantization=self.quantization,
         )
@@ -225,7 +252,7 @@ class ModelLedger:
 
         return self.vae_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
 
-    def text_encoder(self) -> AVGemmaTextEncoderModel:
+    def text_encoder(self) -> GemmaTextEncoder:
         if not hasattr(self, "text_encoder_builder"):
             raise ValueError(
                 "Text encoder not initialized. Please provide a checkpoint path and gemma root path to the "
@@ -233,6 +260,26 @@ class ModelLedger:
             )
 
         return self.text_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+
+    def gemma_embeddings_processor(self) -> EmbeddingsProcessor:
+        if not hasattr(self, "embeddings_processor_builder"):
+            raise ValueError(
+                "Embeddings processor not initialized. Please provide a checkpoint path to the ModelLedger constructor."
+            )
+
+        return (
+            self.embeddings_processor_builder.build(device=self._target_device(), dtype=self.dtype)
+            .to(self.device)
+            .eval()
+        )
+
+    def audio_encoder(self) -> AudioEncoder:
+        if not hasattr(self, "audio_encoder_builder"):
+            raise ValueError(
+                "Audio encoder not initialized. Please provide a checkpoint path to the ModelLedger constructor."
+            )
+
+        return self.audio_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
 
     def audio_decoder(self) -> AudioDecoder:
         if not hasattr(self, "audio_decoder_builder"):

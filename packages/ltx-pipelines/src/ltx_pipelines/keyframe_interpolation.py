@@ -4,7 +4,11 @@ from collections.abc import Iterator
 import torch
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
-from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
+from ltx_core.components.guiders import (
+    MultiModalGuiderFactory,
+    MultiModalGuiderParams,
+    create_multimodal_guider_factory,
+)
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
@@ -14,26 +18,22 @@ from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.text_encoders.gemma import encode_text
-from ltx_core.types import LatentState, VideoPixelShape
+from ltx_core.types import Audio, LatentState, VideoPixelShape
 from ltx_pipelines.utils import ModelLedger
-from ltx_pipelines.utils.args import default_2_stage_arg_parser
-from ltx_pipelines.utils.constants import (
-    AUDIO_SAMPLE_RATE,
-    STAGE_2_DISTILLED_SIGMA_VALUES,
-)
+from ltx_pipelines.utils.args import ImageConditioningInput, default_2_stage_arg_parser, detect_checkpoint_path
+from ltx_pipelines.utils.constants import STAGE_2_DISTILLED_SIGMA_VALUES, detect_params
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
     cleanup_memory,
     denoise_audio_video,
-    euler_denoising_loop,
-    generate_enhanced_prompt,
+    encode_prompts,
     get_device,
     image_conditionings_by_adding_guiding_latent,
-    multi_modal_guider_denoising_func,
+    multi_modal_guider_factory_denoising_func,
     simple_denoising_func,
 )
 from ltx_pipelines.utils.media_io import encode_video
+from ltx_pipelines.utils.samplers import euler_denoising_loop
 from ltx_pipelines.utils.types import PipelineComponents
 
 device = get_device()
@@ -43,8 +43,10 @@ class KeyframeInterpolationPipeline:
     """
     Keyframe-based Two-stage video interpolation pipeline.
     Interpolates between keyframes to generate a video with smoother transitions.
-    Stage 1 generates video at the target resolution, then Stage 2 upsamples
+    Stage 1 generates video at half of the target resolution, then Stage 2 upsamples
     by 2x and refines with additional denoising steps for higher quality output.
+    Stage 1 uses full model while Stage 2 uses distilled LORA for efficiency,
+    as the upsampled video already has good quality and just needs refinement.
     """
 
     def __init__(
@@ -68,7 +70,7 @@ class KeyframeInterpolationPipeline:
             loras=loras,
             quantization=quantization,
         )
-        self.stage_2_model_ledger = self.stage_1_model_ledger.with_loras(
+        self.stage_2_model_ledger = self.stage_1_model_ledger.with_additional_loras(
             loras=distilled_lora,
         )
         self.pipeline_components = PipelineComponents(
@@ -76,7 +78,6 @@ class KeyframeInterpolationPipeline:
             device=device,
         )
 
-    @torch.inference_mode()
     def __call__(  # noqa: PLR0913
         self,
         prompt: str,
@@ -87,12 +88,12 @@ class KeyframeInterpolationPipeline:
         num_frames: int,
         frame_rate: float,
         num_inference_steps: int,
-        video_guider_params: MultiModalGuiderParams,
-        audio_guider_params: MultiModalGuiderParams,
-        images: list[tuple[str, int, float]],
+        video_guider_params: MultiModalGuiderParams | MultiModalGuiderFactory,
+        audio_guider_params: MultiModalGuiderParams | MultiModalGuiderFactory,
+        images: list[ImageConditioningInput],
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
-    ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
+    ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -100,18 +101,15 @@ class KeyframeInterpolationPipeline:
         stepper = EulerDiffusionStep()
         dtype = torch.bfloat16
 
-        text_encoder = self.stage_1_model_ledger.text_encoder()
-        if enhance_prompt:
-            prompt = generate_enhanced_prompt(
-                text_encoder, prompt, images[0][0] if len(images) > 0 else None, seed=seed
-            )
-        context_p, context_n = encode_text(text_encoder, prompts=[prompt, negative_prompt])
-        v_context_p, a_context_p = context_p
-        v_context_n, a_context_n = context_n
-
-        torch.cuda.synchronize()
-        del text_encoder
-        cleanup_memory()
+        ctx_p, ctx_n = encode_prompts(
+            [prompt, negative_prompt],
+            self.stage_1_model_ledger,
+            enhance_first_prompt=enhance_prompt,
+            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+            enhance_prompt_seed=seed,
+        )
+        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
         # Stage 1: Initial low resolution video generation.
         video_encoder = self.stage_1_model_ledger.video_encoder()
@@ -126,12 +124,12 @@ class KeyframeInterpolationPipeline:
                 video_state=video_state,
                 audio_state=audio_state,
                 stepper=stepper,
-                denoise_fn=multi_modal_guider_denoising_func(
-                    video_guider=MultiModalGuider(
+                denoise_fn=multi_modal_guider_factory_denoising_func(
+                    video_guider_factory=create_multimodal_guider_factory(
                         params=video_guider_params,
                         negative_context=v_context_n,
                     ),
-                    audio_guider=MultiModalGuider(
+                    audio_guider_factory=create_multimodal_guider_factory(
                         params=audio_guider_params,
                         negative_context=a_context_n,
                     ),
@@ -241,14 +239,16 @@ class KeyframeInterpolationPipeline:
 @torch.inference_mode()
 def main() -> None:
     logging.getLogger().setLevel(logging.INFO)
-    parser = default_2_stage_arg_parser()
+    checkpoint_path = detect_checkpoint_path()
+    params = detect_params(checkpoint_path)
+    parser = default_2_stage_arg_parser(params=params)
     args = parser.parse_args()
     pipeline = KeyframeInterpolationPipeline(
         checkpoint_path=args.checkpoint_path,
         distilled_lora=args.distilled_lora,
         spatial_upsampler_path=args.spatial_upsampler_path,
         gemma_root=args.gemma_root,
-        loras=args.lora,
+        loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
     )
     tiling_config = TilingConfig.default()
@@ -286,7 +286,6 @@ def main() -> None:
         video=video,
         fps=args.frame_rate,
         audio=audio,
-        audio_sample_rate=AUDIO_SAMPLE_RATE,
         output_path=args.output_path,
         video_chunks_number=video_chunks_number,
     )

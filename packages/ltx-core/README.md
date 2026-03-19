@@ -56,6 +56,58 @@ pip install -e packages/ltx-core
 - **Loader** ([`loader/`](src/ltx_core/loader/)): Model loading from `.safetensors`, LoRA fusion, weight remapping, and memory management
 - **Quantization** ([`quantization/`](src/ltx_core/quantization/)): FP8 quantization backends for reduced memory footprint and faster inference
 
+### Loader
+
+The `loader/` module provides `SingleGPUModelBuilder`, a frozen dataclass that loads a PyTorch model from `.safetensors` checkpoints and optionally fuses one or more LoRA adapters.
+
+#### Basic usage
+
+```python
+from ltx_core.loader import SingleGPUModelBuilder
+
+builder = SingleGPUModelBuilder(
+    model_class_configurator=MyModelConfigurator,
+    model_path="/path/to/model.safetensors",
+)
+model = builder.build(device=torch.device("cuda"))
+```
+
+#### Loading LoRA adapters
+
+Use the `.lora()` method to attach one or more LoRA adapters before calling `.build()`:
+
+```python
+builder = (
+    SingleGPUModelBuilder(
+        model_class_configurator=MyModelConfigurator,
+        model_path="/path/to/model.safetensors",
+    )
+    .lora("/path/to/lora_a.safetensors", strength=0.8)
+    .lora("/path/to/lora_b.safetensors", strength=0.5)
+)
+model = builder.build(device=torch.device("cuda"))
+```
+
+#### Memory-efficient LoRA loading (`lora_load_device`)
+
+By default, LoRA weights are loaded onto the **CPU** (`lora_load_device=torch.device("cpu")`).  This means each LoRA adapter is kept in CPU memory and transferred to the GPU sequentially during weight fusion, which keeps peak GPU memory low even when fusing large adapters.
+
+If all adapters fit comfortably in GPU memory you can skip the CPU staging by setting `lora_load_device` to the target CUDA device:
+
+```python
+import torch
+from ltx_core.loader import SingleGPUModelBuilder
+
+# Load LoRA weights directly onto the GPU (faster, but uses more GPU memory)
+builder = SingleGPUModelBuilder(
+    model_class_configurator=MyModelConfigurator,
+    model_path="/path/to/model.safetensors",
+    lora_load_device=torch.device("cuda"),
+).lora("/path/to/lora.safetensors", strength=1.0)
+
+model = builder.build(device=torch.device("cuda"))
+```
+
 ### Quantization
 
 The `quantization/` module provides FP8 quantization support for the LTX-2 transformer, significantly reducing memory usage while maintaining quality. Two backends are available:

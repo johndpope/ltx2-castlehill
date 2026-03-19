@@ -1,0 +1,175 @@
+# =============================================================================
+# VFM v3a — DMD2 Adversarial Distribution Matching (5K dataset, LTX-2.3 22B)
+# =============================================================================
+# Full training run with:
+#   - GAN discriminator in noisy latent space (DMD2/FlashMotion)
+#   - Flow Distribution Matching with SpatialHead (DiagDistill)
+#   - Spherical Cauchy noise adapter (v1f)
+#   - LoRA rank 32
+#   - 5000 samples, 5000 steps = 1 epoch
+#
+# Precomputed teacher latents at:
+#   /media/12TB/ddit_ditto_data_23/teacher_latents/
+#
+# Usage:
+#   nohup uv run python scripts/train.py configs/ltx2_vfm_v3a_dmd_5k.yaml \
+#     --disable-progress-bars > /tmp/v3a_5k.log 2>&1 &
+# =============================================================================
+
+model:
+  model_path: "/media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_q"
+    - "to_v"
+
+training_strategy:
+  name: "vfm_v3a"
+
+  # === GAN discriminator (DMD2/FlashMotion) ===
+  gan_g_weight: 0.01
+  gan_d_weight: 1.0
+  disc_update_ratio: 1
+  disc_gen_ratio: 5
+  critic_t_min: 0.02
+  critic_t_max: 0.98
+  disc_lr: 2.0e-6
+  disc_hidden_dim: 512
+  disc_num_heads: 8
+  disc_num_layers: 4
+  disc_num_registers: 4
+
+  # === Flow Distribution Matching (DiagDistill) ===
+  flow_match_weight: 4.0
+
+  # === Reconstruction regularizer (decays) ===
+  recon_weight: 0.3
+  recon_decay_steps: 2000
+
+  # === Teacher (precomputed, but kept for reference) ===
+  teacher_num_steps: 8
+  teacher_latents_dir: "teacher_latents"
+
+  # === Spherical Cauchy (v1f) ===
+  spherical_noise: true
+  kappa_min: 1.0
+  kappa_max: 10.0
+  use_slerp_interp: false
+  magnitude_reg_weight: 0.0
+  target_magnitude: 1.0
+  kappa_entropy_weight: 0.0
+  kappa_target: 2.0
+  kappa_pull_weight: 0.0
+
+  # === Per-token sigma ===
+  per_token_sigma: true
+  sigma_min: 0.3
+  sigma_max: 1.0
+  sigma_head_hidden_dim: 256
+  sigma_entropy_weight: 0.0
+  sigma_mean_target: 0.7
+  sigma_mean_pull_weight: 0.0
+
+  # === No distillation ===
+  distill_mode: "none"
+
+  # === v1b Adapter ===
+  adapter_variant: "transformer"
+  adapter_hidden_dim: 512
+  adapter_num_heads: 8
+  adapter_num_layers: 4
+  adapter_pos_dim: 256
+
+  # === VFM Loss ===
+  tau: 1.0
+  obs_noise_level: 0.2
+  alpha: 1.0
+  kl_weight: 0.0001
+  kl_free_bits: 0.1
+  obs_loss_weight: 5.0
+  adaptive_loss: true
+  ema_decay: 0.999
+  first_frame_conditioning_p: 0.0
+
+  # === Diversity ===
+  diversity_weight: 0.1
+  temporal_diversity_weight: 0.1
+  spatial_diversity_weight: 0.05
+  diversity_warmup_steps: 0
+
+  # === mu alignment ===
+  mu_align_weight: 1.0
+  mu_align_warmup_steps: 0
+  freeze_dit_steps: 0
+
+  inverse_problem_weights:
+    i2v: 1.0
+
+  with_audio: false
+
+  log_reconstructions: true
+  reconstruction_log_interval: 200
+  log_vfm_metrics: true
+
+optimization:
+  learning_rate: 1.0e-4
+  adapter_learning_rate: 5.0e-4
+  steps: 5000
+  batch_size: 2
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 200
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+hardware:
+  devices:
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+data:
+  preprocessed_data_root: "/media/12TB/ddit_ditto_data_23"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+checkpoints:
+  interval: 500
+  keep_last_n: 10
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "vfm-v3a"
+  entity: null
+  tags: ["vfm-v3a", "dmd2", "5k-dataset", "rank32", "flow-matching", "ltx-2.3-22b"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/vfm_v3a_dmd_5k"

@@ -63,9 +63,9 @@ training_strategy:
   # === VFM Loss (inherited) ===
   tau: 1.0
   obs_noise_level: 0.2
-  alpha: 0.5
+  alpha: 0.8
   kl_weight: 3.0
-  kl_free_bits: 0.25
+  kl_free_bits: 0.05
   obs_loss_weight: 0.0
   adaptive_loss: false
   ema_decay: 0.999
@@ -83,7 +83,7 @@ training_strategy:
   with_audio: false
 
   log_reconstructions: true
-  reconstruction_log_interval: 500
+  reconstruction_log_interval: 50
   log_vfm_metrics: true
 
 optimization:

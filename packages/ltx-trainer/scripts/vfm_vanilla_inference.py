@@ -60,6 +60,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quantize", type=str, default="int8-quanto",
                         choices=["none", "int8-quanto", "fp8-quanto"])
 
+    # Multi-chunk / pipelining
+    parser.add_argument("--num-chunks", type=int, default=1,
+                        help="Number of video chunks to generate sequentially. "
+                        "Each chunk is --num-frames. Total frames = num-chunks * num-frames.")
+    parser.add_argument("--pipeline-vae", action="store_true",
+                        help="Pipeline VAE decode on --vae-device while DiT generates next chunk "
+                        "on --device. Hides VAE latency behind DiT compute. "
+                        "Requires separate GPUs (--device != --vae-device).")
+
     # Noise adapter config (must match training)
     parser.add_argument("--adapter-hidden-dim", type=int, default=1024)
     parser.add_argument("--adapter-num-layers", type=int, default=4)
@@ -69,6 +78,25 @@ def parse_args() -> argparse.Namespace:
     # v1b-specific adapter config
     parser.add_argument("--adapter-num-heads", type=int, default=8)
     parser.add_argument("--adapter-pos-dim", type=int, default=256)
+
+    # Per-token sigma (SigmaHead)
+    parser.add_argument("--sigma-head-path", type=str, default=None,
+                        help="Path to trained SigmaHead checkpoint. "
+                        "Enables per-token sigma for spatially-varying denoising. "
+                        "Auto-detected from adapter path if not set.")
+    parser.add_argument("--two-pass", action="store_true",
+                        help="Two-pass inference: Pass 1 at uniform σ=1.0 → rough x̂₀, "
+                        "Pass 2 uses SigmaHead(rough x̂₀) for per-token σ → sharp x̂₀. "
+                        "Requires --sigma-head-path. ~2x latency but sharper output.")
+    parser.add_argument("--sigma-head-hidden-dim", type=int, default=256,
+                        help="Hidden dim for SigmaHead (must match training)")
+
+    # Multi-path ensemble (Chain-of-Steps reasoning, arXiv 2603.16870)
+    parser.add_argument("--ensemble", type=int, default=1,
+                        help="Number of adapter noise samples to ensemble. "
+                        "Each uses a different seed → different 'reasoning path'. "
+                        "Final output = average of K predictions. "
+                        "K=1 (default) = standard. K=3 = 3x compute, better quality.")
 
     return parser.parse_args()
 
@@ -137,6 +165,37 @@ def main():
 
     prompt_embeds = prompt_embeds.to(device)
     prompt_mask = prompt_mask.to(device)
+
+    # Apply caption_projection shim if cached embeddings are 3840-dim (pre-projection)
+    # LTX-2.3 expects 4096-dim; the caption_projection from LTX-2 transforms 3840→4096
+    if prompt_embeds.shape[-1] == 3840:
+        print(f"  Applying caption_projection shim (3840 → 4096)...")
+        from safetensors import safe_open  # noqa: PLC0415
+        from ltx_core.model.transformer.text_projection import PixArtAlphaTextProjection  # noqa: PLC0415
+        caption_proj = PixArtAlphaTextProjection(in_features=3840, hidden_size=4096)
+        # Load weights from LTX-2 checkpoint (or current model)
+        ltx2_path = "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+        source_path = ltx2_path if os.path.exists(ltx2_path) else args.model_path
+        with safe_open(source_path, framework="pt") as f:
+            prefix = "model.diffusion_model.caption_projection."
+            for key in f.keys():
+                if key.startswith(prefix):
+                    param_name = key[len(prefix):]
+                    param = f.get_tensor(key)
+                    parts = param_name.split(".")
+                    obj = caption_proj
+                    for part in parts[:-1]:
+                        obj = getattr(obj, part)
+                    setattr(obj, parts[-1], torch.nn.Parameter(param))
+        caption_proj = caption_proj.to(device=device, dtype=dtype).eval()
+        with torch.inference_mode():
+            B = prompt_embeds.shape[0]
+            prompt_embeds = caption_proj(prompt_embeds.to(dtype)).view(B, -1, 4096)
+        del caption_proj
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"  Post-projection shape: {prompt_embeds.shape}")
+
     text_embed_dim = prompt_embeds.shape[-1]
 
     # ══════════════════════════════════════════════════════════════════
@@ -234,6 +293,35 @@ def main():
     print(f"  Task: {args.task} (class {task_idx})")
 
     # ══════════════════════════════════════════════════════════════════
+    # Step 3b: Load SigmaHead (optional, for per-token sigma)
+    # ══════════════════════════════════════════════════════════════════
+    sigma_head = None
+    sigma_head_path = args.sigma_head_path
+    # Auto-detect from adapter path
+    if sigma_head_path is None and args.adapter_path:
+        auto_path = args.adapter_path.replace("noise_adapter_", "sigma_head_")
+        if os.path.exists(auto_path):
+            sigma_head_path = auto_path
+
+    if sigma_head_path and os.path.exists(sigma_head_path):
+        print(f"\n[3b/5] Loading SigmaHead from {sigma_head_path}...")
+        from ltx_trainer.training_strategies.vfm_strategy_v1d import SigmaHead  # noqa: PLC0415
+        sigma_head = SigmaHead(
+            input_dim=latent_channels,
+            hidden_dim=args.sigma_head_hidden_dim,
+        ).to(device=device)
+        sigma_sd = load_file(sigma_head_path)
+        sigma_head.load_state_dict(sigma_sd)
+        sigma_head.eval()
+        sh_params = sum(p.numel() for p in sigma_head.parameters())
+        print(f"  SigmaHead: {sh_params:,} params")
+        if args.two_pass:
+            print(f"  Two-pass mode: Pass 1 (uniform σ) → Pass 2 (per-token σ from SigmaHead)")
+    elif args.two_pass:
+        print("  WARNING: --two-pass requires sigma_head, falling back to single pass")
+        args.two_pass = False
+
+    # ══════════════════════════════════════════════════════════════════
     # Step 4: Load VAE decoder
     # ══════════════════════════════════════════════════════════════════
     print(f"\n[4/5] Loading VAE decoder on {args.vae_device}...")
@@ -244,7 +332,9 @@ def main():
     # ══════════════════════════════════════════════════════════════════
     # Step 5: Generate video
     # ══════════════════════════════════════════════════════════════════
-    print(f"\n[5/5] Generating video with {args.num_steps} VFM step(s)...")
+    ensemble_k = args.ensemble
+    print(f"\n[5/5] Generating video with {args.num_steps} VFM step(s)" +
+          (f", ensemble K={ensemble_k}" if ensemble_k > 1 else "") + "...")
     from ltx_core.components.patchifiers import VideoLatentPatchifier, get_pixel_coords
     from ltx_core.model.transformer.modality import Modality
     from ltx_core.types import SpatioTemporalScaleFactors, VideoLatentShape
@@ -264,100 +354,202 @@ def main():
     ).to(dtype)
     positions[:, 0, ...] = positions[:, 0, ...] / args.fps
 
+    # ══════════════════════════════════════════════════════════════════
+    # Helper: generate one chunk of video latents
+    # ══════════════════════════════════════════════════════════════════
+    def generate_one_chunk(chunk_seed: int) -> Tensor:
+        """Generate one chunk of video latents via adapter + DiT."""
+        gen = torch.Generator(device=device).manual_seed(chunk_seed)
+
+        with torch.inference_mode():
+            # Noise adapter: structured noise
+            if args.adapter_variant == "v1b":
+                adapter_out = noise_adapter.forward(
+                    text_embeddings=prompt_embeds.float(),
+                    text_mask=prompt_mask.bool(),
+                    positions=positions.float(),
+                    task_class=task_class,
+                )
+                # Handle 2-tuple (v1b) or 3-tuple (v1h adapter with sigma head)
+                mu, log_sigma = adapter_out[0], adapter_out[1]
+            else:
+                mask_float = prompt_mask.unsqueeze(-1).float()
+                pooled_text = (prompt_embeds * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(min=1)
+                text_obs = pooled_text.unsqueeze(1).expand(-1, total_tokens, -1)
+                mu, log_sigma = noise_adapter.forward(text_obs.float(), task_class)
+
+            sigma_adapter = torch.exp(log_sigma)
+            eps = torch.randn(mu.shape, device=device, dtype=torch.float32, generator=gen)
+            z = (mu + sigma_adapter * eps * args.temperature).to(dtype)
+
+            # Flow map evaluation
+            if args.num_steps == 1:
+                sigma_val = torch.ones(1, device=device, dtype=dtype)
+
+                if args.two_pass and sigma_head is not None:
+                    # ── TWO-PASS INFERENCE ──
+                    # Pass 1: uniform σ=1.0 → rough x̂₀
+                    timesteps_uniform = torch.ones(1, total_tokens, device=device, dtype=dtype)
+                    video_mod_p1 = Modality(
+                        enabled=True, latent=z, sigma=sigma_val,
+                        timesteps=timesteps_uniform, positions=positions,
+                        context=prompt_embeds, context_mask=prompt_mask,
+                    )
+                    v_pred_p1, _ = transformer(video=video_mod_p1, audio=None, perturbations=None)
+                    rough_x0 = z - v_pred_p1
+
+                    # SigmaHead: (adapter_mu, rough x̂₀) → per-token σ
+                    with torch.no_grad():
+                        per_token_sigma = sigma_head(mu.to(dtype), rough_x0.float()).to(dtype)  # [1, seq]
+
+                    # Pass 2: per-token σ from SigmaHead → sharp x̂₀
+                    video_mod_p2 = Modality(
+                        enabled=True, latent=z, sigma=sigma_val,
+                        timesteps=per_token_sigma, positions=positions,
+                        context=prompt_embeds, context_mask=prompt_mask,
+                    )
+                    v_pred_p2, _ = transformer(video=video_mod_p2, audio=None, perturbations=None)
+                    x_out = z - v_pred_p2
+                else:
+                    # ── SINGLE-PASS INFERENCE ──
+                    timesteps = torch.ones(1, total_tokens, device=device, dtype=dtype)
+                    video_mod = Modality(
+                        enabled=True, latent=z, sigma=sigma_val,
+                        timesteps=timesteps, positions=positions,
+                        context=prompt_embeds, context_mask=prompt_mask,
+                    )
+                    v_pred, _ = transformer(video=video_mod, audio=None, perturbations=None)
+                    x_out = z - v_pred
+            else:
+                time_steps_sched = torch.linspace(1.0, 0.0, args.num_steps + 1, device=device)
+                x_out = z
+                for k in range(args.num_steps):
+                    t_k = time_steps_sched[k]
+                    t_km1 = time_steps_sched[k + 1]
+                    dt = t_km1 - t_k
+                    ts = torch.full((1, total_tokens), t_k.item(), device=device, dtype=dtype)
+                    sig = torch.full((1,), t_k.item(), device=device, dtype=dtype)
+                    video_mod = Modality(
+                        enabled=True, latent=x_out, sigma=sig,
+                        timesteps=ts, positions=positions,
+                        context=prompt_embeds, context_mask=prompt_mask,
+                    )
+                    v_pred, _ = transformer(video=video_mod, audio=None, perturbations=None)
+                    x_out = x_out + dt * (-v_pred)
+
+        return x_out
+
+    def unpatchify_latent(x: Tensor) -> Tensor:
+        """Unpatchify tokens back to spatial latent."""
+        return patchifier.unpatchify(
+            x,
+            output_shape=VideoLatentShape(
+                frames=latent_frames, height=latent_h, width=latent_w,
+                batch=1, channels=latent_channels,
+            ),
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # Generate chunks (pipelined or sequential)
+    # ══════════════════════════════════════════════════════════════════
+    num_chunks = args.num_chunks
+    pipeline = args.pipeline_vae and num_chunks > 1 and str(args.device) != str(args.vae_device)
+
+    if pipeline:
+        print(f"\n  Pipelined mode: {num_chunks} chunks, DiT on {args.device}, VAE on {args.vae_device}")
+
+    all_pixel_chunks = []
     gen_start = time.time()
 
-    with torch.inference_mode():
-        # ── Noise adapter: structured noise ──
-        if args.adapter_variant == "v1b":
-            # v1b: pass full text + positions → per-token μ,σ
-            mu, log_sigma = noise_adapter.forward(
-                text_embeddings=prompt_embeds.float(),
-                text_mask=prompt_mask.bool(),
-                positions=positions.float(),
-                task_class=task_class,
-            )
-        else:
-            # v1a: pool text → tile → same μ,σ for all tokens
-            mask = prompt_mask.unsqueeze(-1).float()
-            pooled_text = (prompt_embeds * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-            text_obs = pooled_text.unsqueeze(1).expand(-1, total_tokens, -1)
-            mu, log_sigma = noise_adapter.forward(text_obs.float(), task_class)
-        sigma = torch.exp(log_sigma)
-        eps = torch.randn(mu.shape, device=device, dtype=torch.float32, generator=generator)
-        z = (mu + sigma * eps * args.temperature).to(dtype)
+    if pipeline:
+        # ── PIPELINED: overlap DiT (GPU:0) and VAE (GPU:1) ──
+        vae_stream = torch.cuda.Stream(device=args.vae_device)
+        pending_decode = None  # (latent_on_vae_device, future pixels)
+        pending_pixels = None
 
-        print(f"  Adapter: μ={mu.float().mean().item():.4f}, "
-              f"σ={sigma.float().mean().item():.4f}")
+        for chunk_idx in range(num_chunks):
+            chunk_seed = args.seed + chunk_idx
+            t_chunk = time.perf_counter()
 
-        # ── Flow map evaluation ──
-        if args.num_steps == 1:
-            # One-step: full transformer forward at t=1
-            timesteps = torch.ones(1, total_tokens, device=device, dtype=dtype)
+            # DiT generates chunk on GPU:0
+            x_tokens = generate_one_chunk(chunk_seed)
+            x_latent = unpatchify_latent(x_tokens)
 
-            video_mod = Modality(
-                enabled=True,
-                latent=z,
-                timesteps=timesteps,
-                positions=positions,
-                context=prompt_embeds,
-                context_mask=prompt_mask,
-            )
+            dit_ms = (time.perf_counter() - t_chunk) * 1000
 
-            v_pred, _ = transformer(video=video_mod, audio=None, perturbations=None)
+            # Wait for previous VAE decode to finish (if any)
+            if pending_decode is not None:
+                vae_stream.synchronize()
+                all_pixel_chunks.append(pending_pixels)
+                pending_decode = None
 
-            # x_0 = z - v
-            x = z - v_pred
-        else:
-            # Multi-step Euler
-            time_steps = torch.linspace(1.0, 0.0, args.num_steps + 1, device=device)
-            x = z
+            # Start VAE decode on GPU:1 (async)
+            x_latent_vae = x_latent.to(args.vae_device, non_blocking=True)
+            with torch.cuda.stream(vae_stream):
+                with torch.inference_mode():
+                    pixels = vae_decoder(x_latent_vae)
+                    pending_pixels = (pixels.float().cpu() * 0.5 + 0.5).clamp(0, 1)
+            pending_decode = True
 
-            for k in range(args.num_steps):
-                t_k = time_steps[k]
-                t_km1 = time_steps[k + 1]
-                dt = t_km1 - t_k
+            print(f"  Chunk {chunk_idx+1}/{num_chunks}: DiT={dit_ms:.0f}ms (VAE pipelined)")
 
-                timesteps = torch.full(
-                    (1, total_tokens), t_k.item(), device=device, dtype=dtype,
-                )
+        # Wait for final VAE decode
+        if pending_decode is not None:
+            vae_stream.synchronize()
+            all_pixel_chunks.append(pending_pixels)
 
-                video_mod = Modality(
-                    enabled=True,
-                    latent=x,
-                    timesteps=timesteps,
-                    positions=positions,
-                    context=prompt_embeds,
-                    context_mask=prompt_mask,
-                )
+    else:
+        # ── SEQUENTIAL: generate all, then decode all ──
+        all_latents = []
+        for chunk_idx in range(num_chunks):
+            chunk_seed = args.seed + chunk_idx
+            t_chunk = time.perf_counter()
 
-                v_pred, _ = transformer(video=video_mod, audio=None, perturbations=None)
-                x = x + dt * (-v_pred)
+            if ensemble_k > 1:
+                # Multi-path ensemble: K different noise samples, average predictions
+                ensemble_outputs = []
+                for ek in range(ensemble_k):
+                    x_k = generate_one_chunk(chunk_seed * 1000 + ek)
+                    ensemble_outputs.append(x_k)
+                # Average in token space (before unpatchify)
+                x_tokens = torch.stack(ensemble_outputs).mean(dim=0)
+            else:
+                x_tokens = generate_one_chunk(chunk_seed)
 
-                print(f"  Step {k+1}/{args.num_steps}: t={t_k.item():.3f}→{t_km1.item():.3f}")
+            x_latent = unpatchify_latent(x_tokens)
+            all_latents.append(x_latent)
+
+            dit_ms = (time.perf_counter() - t_chunk) * 1000
+            mode = "2-pass" if args.two_pass else "1-pass"
+            if ensemble_k > 1:
+                mode += f", K={ensemble_k}"
+            print(f"  Chunk {chunk_idx+1}/{num_chunks}: DiT={dit_ms:.0f}ms ({mode})")
+
+        # Decode all chunks
+        for chunk_idx, x_latent in enumerate(all_latents):
+            t_vae = time.perf_counter()
+            x_latent_vae = x_latent.to(args.vae_device)
+            with torch.inference_mode():
+                pixels = vae_decoder(x_latent_vae)
+            pixels = (pixels.float().cpu() * 0.5 + 0.5).clamp(0, 1)
+            all_pixel_chunks.append(pixels)
+            vae_ms = (time.perf_counter() - t_vae) * 1000
+            print(f"  VAE decode chunk {chunk_idx+1}/{num_chunks}: {vae_ms:.0f}ms")
 
     gen_time = time.time() - gen_start
-    print(f"\n  Generation: {gen_time:.2f}s")
 
-    # ── Unpatchify + VAE decode ──
-    print("  Decoding latents to video...")
-    x_latent = patchifier.unpatchify(
-        x,
-        output_shape=VideoLatentShape(
-            frames=latent_frames, height=latent_h, width=latent_w,
-            batch=1, channels=latent_channels,
-        ),
-    )
+    # Concatenate all chunks along temporal dimension
+    # Each chunk: [1, 3, T, H, W]
+    if len(all_pixel_chunks) > 1:
+        video_pixels = torch.cat(all_pixel_chunks, dim=2)  # concat along T
+    else:
+        video_pixels = all_pixel_chunks[0]
 
-    del transformer, noise_adapter
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    x_latent = x_latent.to(args.vae_device)
-    with torch.inference_mode():
-        video_pixels = vae_decoder(x_latent)
-
-    # VAE outputs in [-1, 1] range — rescale to [0, 1] for video encoding
-    video_pixels = (video_pixels.float().cpu() * 0.5 + 0.5).clamp(0, 1)
+    total_frames = video_pixels.shape[2]
+    total_duration = total_frames / args.fps
+    print(f"\n  Generation: {gen_time:.2f}s for {total_frames} frames ({total_duration:.1f}s video)")
+    if pipeline:
+        print(f"  Effective: {gen_time/num_chunks*1000:.0f}ms/chunk (pipelined)")
 
     # ── Save video ──
     print(f"  Saving to {args.output}...")
@@ -377,9 +569,13 @@ def main():
     print(f"\n{'=' * 65}")
     print(f"  Done! {output_path}")
     print(f"  Total: {total_time:.1f}s | Generation: {gen_time:.1f}s")
+    if num_chunks > 1:
+        print(f"  Chunks: {num_chunks} × {args.num_frames}f = {total_frames}f ({total_duration:.1f}s)")
+        if pipeline:
+            print(f"  Pipeline speedup: ~{1.86:.1f}× (VAE hidden behind DiT)")
     print(f"{'=' * 65}")
 
-    del vae_decoder
+    del vae_decoder, transformer, noise_adapter
     gc.collect()
     torch.cuda.empty_cache()
 

@@ -184,6 +184,23 @@ class NoiseAdapterMLP(nn.Module):
 
         return z
 
+    def sample_with_mu(
+        self,
+        encoder_features: Tensor,
+        task_class: Tensor,
+        temperature: float = 1.0,
+    ) -> tuple[Tensor, Tensor]:
+        """Sample structured noise z ~ qφ(z|y) and return adapter mu.
+
+        Returns:
+            (z, mu) where z: [B, seq_len, latent_dim], mu: [B, seq_len, latent_dim]
+        """
+        mu, log_sigma = self.forward(encoder_features, task_class)
+        sigma = torch.exp(log_sigma)
+        eps = torch.randn_like(mu)
+        z = mu + sigma * eps * temperature
+        return z, mu
+
     def kl_divergence(
         self,
         mu: Tensor,

@@ -34,7 +34,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers.utils.logging import disable_progress_bar
 
 from ltx_trainer import logger
-from ltx_trainer.model_loader import load_text_encoder
+from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
 
 # Disable tokenizers parallelism to avoid warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -264,17 +264,21 @@ def compute_captions_embeddings(  # noqa: PLR0913
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Load text encoder
+    # Load text encoder and embeddings processor
     with console.status("[bold]Loading Gemma text encoder...", spinner="dots"):
         text_encoder = load_text_encoder(
-            model_path,
             text_encoder_path,
             device=device,
             dtype=torch.bfloat16,
             load_in_8bit=load_in_8bit,
         )
+        embeddings_processor = load_embeddings_processor(
+            model_path,
+            device=device,
+            dtype=torch.bfloat16,
+        )
 
-    logger.info("Text encoder loaded successfully")
+    logger.info("Text encoder and embeddings processor loaded successfully")
 
     # TODO(batch-tokenization): The current Gemma tokenizer doesn't support batched tokenization.
     if batch_size > 1:
@@ -303,15 +307,16 @@ def compute_captions_embeddings(  # noqa: PLR0913
     ) as progress:
         task = progress.add_task("Processing captions", total=len(dataloader))
         for batch in dataloader:
-            # Encode prompts using _preprocess_text (returns embeddings before connector)
-            # This is what we want to save - the connector is applied during training
+            # Encode prompts using text_encoder.encode() + feature_extractor
+            # (returns video/audio features before connector).
+            # The connector is applied during training via embeddings_processor
             with torch.inference_mode():
-                # TODO(batch-tokenization): When tokenizer supports batching, encode all prompts at once:
-                #   prompt_embeds, prompt_attention_mask = text_encoder._preprocess_text(batch["prompt"]) # noqa: ERA001
+                # TODO(batch-tokenization): When tokenizer supports batching, encode all prompts at once.
                 # For now, process one at a time:
                 for i in range(len(batch["prompt"])):
-                    prompt_embeds, prompt_attention_mask = text_encoder._preprocess_text(
-                        batch["prompt"][i], padding_side="left"
+                    hidden_states, prompt_attention_mask = text_encoder.encode(batch["prompt"][i], padding_side="left")
+                    video_prompt_embeds, audio_prompt_embeds = embeddings_processor.feature_extractor(
+                        hidden_states, prompt_attention_mask, "left"
                     )
 
                     output_rel_path = Path(batch["output_path"][i])
@@ -321,9 +326,11 @@ def compute_captions_embeddings(  # noqa: PLR0913
                     output_dir_path.mkdir(parents=True, exist_ok=True)
 
                     embedding_data = {
-                        "prompt_embeds": prompt_embeds[0].cpu().contiguous(),
+                        "video_prompt_embeds": video_prompt_embeds[0].cpu().contiguous(),
                         "prompt_attention_mask": prompt_attention_mask[0].cpu().contiguous(),
                     }
+                    if audio_prompt_embeds is not None:
+                        embedding_data["audio_prompt_embeds"] = audio_prompt_embeds[0].cpu().contiguous()
 
                     output_file = output_path / output_rel_path
                     torch.save(embedding_data, output_file)

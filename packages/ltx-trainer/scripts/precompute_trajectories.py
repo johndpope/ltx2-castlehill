@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pre-compute teacher trajectories for VFM distillation")
 
     parser.add_argument("--model-path", type=str,
-                        default="/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors")
+                        default="/media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors")
     parser.add_argument("--data-root", type=str, required=True,
                         help="Root dir with latents_19b/ and conditions_final/")
     parser.add_argument("--output-dir", type=str, default=None,
@@ -78,6 +78,8 @@ def parse_args() -> argparse.Namespace:
                         help="Base seed (per-sample seed = base_seed + sample_idx)")
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Limit number of samples to process")
+    parser.add_argument("--skip-samples", type=int, default=0,
+                        help="Skip first N samples (for multi-GPU splitting)")
 
     return parser.parse_args()
 
@@ -110,6 +112,8 @@ def main():
         if cf.exists():
             samples.append((lf, cf))
 
+    if args.skip_samples:
+        samples = samples[args.skip_samples:]
     if args.max_samples:
         samples = samples[:args.max_samples]
 
@@ -150,6 +154,45 @@ def main():
     transformer.eval()
 
     print(f"  Loaded in {time.time() - t0:.1f}s, VRAM: {torch.cuda.memory_allocated(device) / 1e9:.1f} GB")
+
+    # ── Load embeddings processor + caption_projection shim ─────────
+    # LTX-2.3 cached embeddings are 3840-dim (from feature extractor precompute).
+    # The connector expects 4096-dim (post caption_projection).
+    # We load caption_projection from LTX-2 (19B) checkpoint as a shim.
+    embeddings_processor = None
+    caption_projection_shim = None
+    needs_connector = not (hasattr(transformer, 'caption_projection') and transformer.caption_projection is not None)
+
+    if needs_connector:
+        print("  LTX-2.3 detected: loading embeddings processor + caption_projection shim...")
+        from ltx_trainer.model_loader import load_embeddings_processor
+        embeddings_processor = load_embeddings_processor(
+            checkpoint_path=args.model_path,
+            device=str(device),
+            dtype=dtype,
+        )
+        embeddings_processor.eval()
+
+        # Load caption_projection shim (3840→4096) from LTX-2 checkpoint
+        from safetensors import safe_open
+        from ltx_core.model.transformer.text_projection import PixArtAlphaTextProjection
+        caption_proj = PixArtAlphaTextProjection(in_features=3840, hidden_size=4096)
+        ltx2_path = "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+        with safe_open(ltx2_path, framework="pt", device="cpu") as f:
+            prefix = "model.diffusion_model.caption_projection."
+            for key in f.keys():
+                if key.startswith(prefix):
+                    param_name = key[len(prefix):]
+                    param = f.get_tensor(key)
+                    parts = param_name.split(".")
+                    obj = caption_proj
+                    for part in parts[:-1]:
+                        obj = getattr(obj, part)
+                    setattr(obj, parts[-1], torch.nn.Parameter(param))
+        caption_projection_shim = caption_proj.to(device).eval()
+        for p in caption_projection_shim.parameters():
+            p.requires_grad = False
+        print(f"  Embeddings processor + caption_projection shim loaded")
 
     # ── Compute sigma schedule ───────────────────────────────────────
     if args.bezier_schedule:
@@ -222,9 +265,28 @@ def main():
             x0_raw = lat_data["latents"].unsqueeze(0).to(device, dtype=dtype)
             x0 = patchifier.patchify(x0_raw)  # [1, total_tokens, 128]
 
-            # Text embeddings
-            prompt_embeds = cond_data["video_prompt_embeds"].unsqueeze(0).to(device, dtype=dtype)
+            # Text embeddings — apply connector if needed (3840 → 4096)
+            video_features = cond_data["video_prompt_embeds"].unsqueeze(0).to(device, dtype=dtype)
+            audio_features = cond_data.get("audio_prompt_embeds", video_features)
+            if audio_features.dim() == 2:
+                audio_features = audio_features.unsqueeze(0).to(device, dtype=dtype)
             prompt_mask = cond_data["prompt_attention_mask"].unsqueeze(0).to(device)
+
+            if embeddings_processor is not None:
+                from ltx_core.text_encoders.gemma import convert_to_additive_mask
+                # Apply caption_projection shim: 3840 → 4096
+                if caption_projection_shim is not None:
+                    batch_size = video_features.shape[0]
+                    video_features = caption_projection_shim(video_features).view(batch_size, -1, 4096)
+                # Use video_connector directly (audio connector has different dims in 2.3)
+                additive_mask = convert_to_additive_mask(prompt_mask, video_features.dtype)
+                prompt_embeds, prompt_mask = embeddings_processor.video_connector(
+                    video_features, additive_mask,
+                )
+                # Convert additive mask back to binary
+                prompt_mask = (prompt_mask.squeeze(1).squeeze(1) >= -9000.0).long()
+            else:
+                prompt_embeds = video_features
 
             # Sample initial noise z ~ N(0, I) with deterministic seed
             generator = torch.Generator(device=device).manual_seed(sample_seed)
@@ -246,6 +308,7 @@ def main():
                     timesteps = torch.full((1, total_tokens), sigma.item(), device=device, dtype=dtype)
                     video_mod = Modality(
                         enabled=True,
+                        sigma=sigma.unsqueeze(0),  # [1,] per-batch sigma for prompt AdaLN (2.3)
                         latent=x_t,
                         timesteps=timesteps,
                         positions=positions,

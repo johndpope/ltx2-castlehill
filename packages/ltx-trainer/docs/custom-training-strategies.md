@@ -282,6 +282,7 @@ class InpaintingStrategy(TrainingStrategy):
         video_modality = Modality(
             enabled=True,
             latent=noisy_latents,
+            sigma=sigmas,
             timesteps=timesteps,
             positions=positions,
             context=video_prompt_embeds,

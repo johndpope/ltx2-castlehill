@@ -1,0 +1,163 @@
+# =============================================================================
+# VFM v1f — ALIGNED TO PAPER (arXiv:2603.07276) — 5K overnight
+# =============================================================================
+# Paper Eq.19: L = (1/2τ²)·L_MF + (1/2σ²)·L_obs + L_KL
+#
+# Key alignment changes:
+#   - obs_loss_weight: 25.0 (= 1/(2σ²) with σ=0.2 → 1/0.08 = 12.5, doubled for safety)
+#     Paper says L_obs is CRITICAL — provides conditioning signal to adapter
+#   - adaptive_loss: true (Algorithm 2 line 15: w = 1/stopgrad(‖L‖ + γ)^p)
+#   - tau: 1.0 → L_MF weight = 1/(2τ²) = 0.5 (paper uses τ=1-100)
+#   - kl_weight: 0.001 (paper: L_KL, no explicit weight mentioned)
+#   - alpha: 0.8 (paper Algorithm 2: unconditional mixing for flow map quality)
+#   - ema_decay: 0.999 (paper: EMA of θ for L_obs stability)
+#
+# Usage:
+#   nohup uv run python scripts/train.py configs/ltx2_vfm_v1f_pertoken_5k_23.yaml \
+#     --disable-progress-bars > /tmp/vfm_v1f_5k_overnight.log 2>&1 &
+# =============================================================================
+
+model:
+  model_path: "/media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+
+lora:
+  rank: 4
+  alpha: 4
+  dropout: 0.0
+  target_modules:
+    - "to_q"
+    - "to_v"
+
+training_strategy:
+  name: "vfm_v1f"
+
+  # === Spherical Cauchy (v1f) ===
+  spherical_noise: true
+  kappa_min: 0.1
+  kappa_max: 5.0
+  use_slerp_interp: false
+  magnitude_reg_weight: 0.1
+  target_magnitude: 1.0
+  kappa_entropy_weight: 0.01
+  kappa_target: 2.0
+  kappa_pull_weight: 0.1
+
+  # === Per-token sigma (x₀-conditioned SigmaHead) ===
+  per_token_sigma: true
+  sigma_min: 0.3
+  sigma_max: 1.0
+  sigma_head_hidden_dim: 256
+  sigma_entropy_weight: 0.1
+  sigma_mean_target: 0.7
+  sigma_mean_pull_weight: 0.05
+
+  # === No distillation — standard flow matching ===
+  distill_mode: "none"
+
+  # === v1b Adapter ===
+  adapter_variant: "transformer"
+  adapter_hidden_dim: 512
+  adapter_num_heads: 8
+  adapter_num_layers: 4
+  adapter_pos_dim: 256
+
+  # === VFM Loss (Paper Eq.19) ===
+  # L = (1/2τ²)·L_MF + (1/2σ²)·L_obs + L_KL
+  tau: 1.0                       # τ: data misfit tolerance (paper ablates 1-100)
+  obs_noise_level: 0.2           # σ for observation noise y = A(x) + ε
+  alpha: 0.8                     # Prob of using adapter noise (1-α = unconditional N(0,I))
+  kl_weight: 0.001               # L_KL weight (spherical KL has constant floor ~14.8)
+  kl_free_bits: 0.05
+  obs_loss_weight: 12.5          # = 1/(2σ²) with σ=0.2 → 1/(2·0.04) = 12.5 (Paper Eq.19)
+  adaptive_loss: true            # Paper Algorithm 2: w = 1/stopgrad(‖L‖ + γ)^p
+  ema_decay: 0.999               # Paper: θ⁻ = EMA(θ) for L_obs stability
+  first_frame_conditioning_p: 0.5 # i2v conditioning — higher than before for more obs signal
+
+  # === Diversity ===
+  diversity_weight: 0.1
+  temporal_diversity_weight: 0.1
+  spatial_diversity_weight: 0.05
+  diversity_warmup_steps: 200
+
+  inverse_problem_weights:
+    i2v: 1.0
+
+  with_audio: false
+
+  log_reconstructions: true
+  reconstruction_log_interval: 200
+  log_vfm_metrics: true
+
+optimization:
+  learning_rate: 3.0e-4
+  steps: 10000
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 500
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+hardware:
+  devices:
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+data:
+  preprocessed_data_root: "/media/12TB/ddit_ditto_data_23"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+validation:
+  prompts: []
+  negative_prompt: "blurry, distorted, low quality"
+  video_dims: [768, 448, 25]
+  frame_rate: 20.0
+  seed: 42
+  inference_steps: 1
+  interval: null
+  videos_per_prompt: 1
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_v"
+  generate_audio: false
+  skip_initial_validation: true
+
+checkpoints:
+  interval: 500
+  keep_last_n: 5
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "vfm-v1f"
+  entity: null
+  tags: ["vfm-v1f", "paper-aligned", "L_obs-enabled", "adaptive-loss", "5k-dataset", "overnight", "ltx-2.3-22b"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/vfm_v1f_pertoken_5k_23"

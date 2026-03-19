@@ -278,6 +278,14 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         help="Device to run on (cuda/cpu)",
     )
 
+    # Clifford attention arguments
+    parser.add_argument("--self-attn-type", default="standard",
+                        choices=["standard", "clifford_video"],
+                        help="Self-attention type (use clifford_video for Clifford LoRA checkpoints)")
+    parser.add_argument("--num-spatial-shifts", type=int, default=12)
+    parser.add_argument("--num-temporal-shifts", type=int, default=4)
+    parser.add_argument("--num-channel-shifts", type=int, default=4)
+
     args = parser.parse_args()
 
     # Validate conditioning arguments
@@ -306,8 +314,33 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         text_encoder_path=args.text_encoder_path,
     )
 
-    # Apply LoRA weights if provided
+    # Apply Clifford attention swap if requested
     transformer = components.transformer
+    if getattr(args, "self_attn_type", "standard") != "standard":
+        from ltx_core.model.transformer.clifford_attention import CliffordVideoAttention
+        from ltx_core.model.transformer.attention import Attention
+        swapped = 0
+        for block in transformer.transformer_blocks:
+            old = block.attn1
+            if isinstance(old, Attention):
+                new_attn = CliffordVideoAttention(
+                    query_dim=old.to_q.in_features, heads=old.heads, dim_head=old.dim_head,
+                    norm_eps=1e-6, rope_type=old.rope_type, attention_function=old.attention_function,
+                    apply_gated_attention=old.to_gate_logits is not None,
+                    num_spatial_shifts=getattr(args, "num_spatial_shifts", 12),
+                    num_temporal_shifts=getattr(args, "num_temporal_shifts", 4),
+                    num_channel_shifts=getattr(args, "num_channel_shifts", 4),
+                )
+                new_attn.to_q = old.to_q; new_attn.to_k = old.to_k
+                new_attn.to_v = old.to_v; new_attn.to_out = old.to_out
+                new_attn.q_norm = old.q_norm; new_attn.k_norm = old.k_norm
+                if old.to_gate_logits is not None:
+                    new_attn.to_gate_logits = old.to_gate_logits
+                block.attn1 = new_attn
+                swapped += 1
+        print(f"Swapped {swapped} self-attention blocks to {args.self_attn_type}")
+
+    # Apply LoRA weights if provided
     if args.lora_path is not None:
         transformer = load_lora_weights(transformer, args.lora_path)
 
@@ -389,11 +422,16 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     # Generate with progress bar
     with StandaloneSamplingProgress(num_steps=args.num_inference_steps) as progress:
         # Create sampler with progress context
+        # Load embeddings processor for text-to-embedding conversion
+        from ltx_trainer.model_loader import load_embeddings_processor
+        embeddings_processor = load_embeddings_processor(args.checkpoint, device="cpu")
+
         sampler = ValidationSampler(
             transformer=transformer,
             vae_decoder=components.video_vae_decoder,
             vae_encoder=components.video_vae_encoder,
             text_encoder=components.text_encoder,
+            embeddings_processor=embeddings_processor,
             audio_decoder=components.audio_vae_decoder if generate_audio else None,
             vocoder=components.vocoder if generate_audio else None,
             sampling_context=progress,
@@ -410,7 +448,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     # Get audio sample rate from vocoder if audio was generated
     audio_sample_rate = None
     if audio is not None and components.vocoder is not None:
-        audio_sample_rate = components.vocoder.output_sample_rate
+        audio_sample_rate = components.vocoder.output_sampling_rate
 
     save_video(
         video_tensor=video,

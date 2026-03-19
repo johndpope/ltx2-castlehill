@@ -1,0 +1,157 @@
+# =============================================================================
+# VFM v1f BASELINE — Spherical Cauchy + standard timesteps (NO per-token sigma)
+# =============================================================================
+# Stripped-down sanity check: can the adapter + LoRA produce coherent 1-step
+# video when trained with standard flow matching timestep sampling?
+#
+# Key difference from ltx2_vfm_v1f_spherical.yaml:
+#   - per_token_sigma: false — uses standard shifted_logit_normal timesteps
+#   - No sigma head, no sigma collapse problem
+#   - Model sees sigma near 1.0 during training → matches inference
+#   - Reduced diversity/kl weights to keep it simple
+#
+# This tests: adapter noise (spherical) + standard timesteps → 1-step video
+#
+# Usage:
+#   uv run python scripts/train.py configs/ltx2_vfm_v1f_baseline.yaml
+# =============================================================================
+
+model:
+  model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+training_strategy:
+  name: "vfm_v1f"
+
+  # === Spherical Cauchy (v1f) ===
+  spherical_noise: true
+  kappa_min: 0.1
+  kappa_max: 50.0
+  use_slerp_interp: false
+  magnitude_reg_weight: 0.1
+  target_magnitude: 1.0
+  kappa_entropy_weight: 0.01
+  kappa_target: 2.0
+  kappa_pull_weight: 0.05
+
+  # === DISABLED per-token sigma — use standard timestep sampling ===
+  per_token_sigma: false
+
+  # === No distillation ===
+  distill_mode: "none"
+
+  # === v1b Adapter (inherited) ===
+  adapter_variant: "transformer"
+  adapter_hidden_dim: 512
+  adapter_num_heads: 8
+  adapter_num_layers: 4
+  adapter_pos_dim: 256
+
+  # === VFM Loss ===
+  tau: 1.0
+  obs_noise_level: 0.2
+  alpha: 0.8
+  kl_weight: 3.0
+  kl_free_bits: 0.05
+  obs_loss_weight: 0.0
+  adaptive_loss: false
+  ema_decay: 0.999
+  first_frame_conditioning_p: 0.1
+
+  # === Diversity (keep light) ===
+  diversity_weight: 0.1
+  temporal_diversity_weight: 0.1
+  spatial_diversity_weight: 0.05
+  diversity_warmup_steps: 200
+
+  inverse_problem_weights:
+    i2v: 1.0
+
+  with_audio: false
+
+  log_reconstructions: true
+  reconstruction_log_interval: 100
+  log_vfm_metrics: true
+
+optimization:
+  learning_rate: 3.0e-4
+  steps: 3000
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 200
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+hardware:
+  devices:
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+data:
+  preprocessed_data_root: "/media/12TB/ddit_ditto_data"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+validation:
+  prompts: []
+  negative_prompt: "blurry, distorted, low quality"
+  video_dims: [768, 448, 25]
+  frame_rate: 20.0
+  seed: 42
+  inference_steps: 1
+  interval: null
+  videos_per_prompt: 1
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_v"
+  generate_audio: false
+  skip_initial_validation: true
+
+checkpoints:
+  interval: 500
+  keep_last_n: 5
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "vfm-v1f"
+  entity: null
+  tags: ["vfm-v1f", "baseline", "no-per-token-sigma", "spherical-cauchy"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/vfm_v1f_baseline"

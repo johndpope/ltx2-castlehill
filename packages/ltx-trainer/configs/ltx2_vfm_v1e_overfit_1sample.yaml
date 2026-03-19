@@ -106,12 +106,12 @@ acceleration:
 
 hardware:
   devices:
-    text_encoder: "cuda:1"
-    vae_encoder: "cuda:1"
-    vae_decoder: "cuda:1"
-    transformer: "cuda:0"
-    audio_vae: "cuda:0"
-    vocoder: "cuda:0"
+    text_encoder: "cuda:0"
+    vae_encoder: "cuda:0"
+    vae_decoder: "cuda:0"
+    transformer: "cuda:1"
+    audio_vae: "cuda:1"
+    vocoder: "cuda:1"
 
 data:
   preprocessed_data_root: "/media/12TB/ddit_ditto_data"

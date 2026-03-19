@@ -1,0 +1,106 @@
+# =============================================================================
+# VFM v3b — Self-E on 5K dataset (resume from overfit-10 step 5000)
+# =============================================================================
+# The 10-sample overfit converged (loss_data ~0.04). LoRA + adapter weights
+# encode general 1-step denoising. Now scale to 5K to learn diverse prompts.
+#
+# Key changes from overfit:
+#   - 5000 samples instead of 10
+#   - batch_size=2, grad_accum=2 (effective batch 4)
+#   - 10000 steps = 2 epochs
+#   - Checkpoints every 500 for inference testing
+# =============================================================================
+
+model:
+  model_path: "/media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+  # Resume from converged overfit-10 checkpoint
+  load_checkpoint: "/media/2TB/omnitransfer/output/vfm_v3b_self_e_20k/checkpoints/lora_weights_step_05000.safetensors"
+  load_noise_adapter: "/media/2TB/omnitransfer/output/vfm_v3b_self_e_20k/checkpoints/noise_adapter_step_05000.safetensors"
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+
+training_strategy:
+  name: "vfm_v3b"
+
+  # Spherical Cauchy adapter
+  spherical_noise: true
+  kl_weight: 0.001
+
+  # Self-evaluation (same as overfit)
+  self_eval_weight: 1.0
+  self_eval_cfg_scale: 5.0
+  self_eval_s_range: [0.1, 0.5]
+  energy_preserving_norm: true
+  self_eval_prob: 0.5
+
+  recon_weight: 0.0
+  flow_match_weight: 0.0
+  latent_perceptual_weight: 1.0   # Multi-scale structural similarity in latent space
+
+  log_reconstructions: true
+  reconstruction_log_interval: 500
+  log_vfm_metrics: true
+
+optimization:
+  learning_rate: 5.0e-4
+  adapter_learning_rate: 1.0e-3
+  steps: 10000
+  batch_size: 2
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 100
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+hardware:
+  devices:
+    transformer: "cuda:0"      # RTX 5090 32GB
+    vae_decoder: "cuda:1"      # RTX PRO 4000 24GB
+    vae_encoder: "cuda:1"
+
+data:
+  preprocessed_data_root: "/media/12TB/ddit_ditto_data_23"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+checkpoints:
+  interval: 500
+  keep_last_n: 5
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "vfm-v3b"
+  entity: null
+  tags: ["self-e", "vfm-v3b", "5k-dataset", "resume-overfit", "rank32"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/vfm_v3b_self_e_5k"

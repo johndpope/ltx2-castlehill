@@ -53,8 +53,13 @@ from ltx_trainer.timestep_samplers import TimestepSampler
 class SigmaHead(nn.Module):
     """Per-token sigma predictor.
 
-    Takes adapter μ output [B, seq, latent_dim] and predicts per-token
-    noise level σ_i ∈ [sigma_min, sigma_max] for each token.
+    Takes clean latent x₀ [B, seq, latent_dim] (and optionally adapter μ)
+    to predict per-token noise level σ_i ∈ [sigma_min, sigma_max].
+
+    Key insight: x₀ has inherent spatial variance (edges, motion, texture)
+    that enables the head to differentiate tokens even before the adapter
+    has converged. Adapter μ is concatenated when available to allow the
+    sigma schedule to adapt as training progresses.
 
     The output is constrained to [sigma_min, sigma_max] via sigmoid scaling
     to prevent degenerate solutions (all-zero or all-one sigmas).
@@ -71,8 +76,11 @@ class SigmaHead(nn.Module):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
 
+        # Input: x₀ (latent_dim) + adapter_mu (latent_dim) = 2 * latent_dim
+        input_dim = latent_dim * 2
+
         self.net = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
@@ -83,16 +91,25 @@ class SigmaHead(nn.Module):
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
-    def forward(self, mu: Tensor) -> Tensor:
-        """Predict per-token sigma from adapter mu.
+    def forward(self, mu: Tensor, x0: Tensor | None = None) -> Tensor:
+        """Predict per-token sigma from clean latent x₀ and adapter mu.
 
         Args:
             mu: Adapter mean output [B, seq, latent_dim]
+            x0: Clean patchified latent [B, seq, latent_dim]. If None,
+                zeros are used (backward compat, but defeats the purpose).
 
         Returns:
             Per-token sigma [B, seq] in [sigma_min, sigma_max]
         """
-        raw = self.net(mu).squeeze(-1)  # [B, seq]
+        if x0 is not None:
+            # Concat x₀ + adapter_mu → [B, seq, 2*latent_dim]
+            inp = torch.cat([x0.detach(), mu], dim=-1)
+        else:
+            # Fallback: pad with zeros (shouldn't happen in normal training)
+            inp = torch.cat([torch.zeros_like(mu), mu], dim=-1)
+
+        raw = self.net(inp).squeeze(-1)  # [B, seq]
         # Sigmoid → [0, 1] → scale to [sigma_min, sigma_max]
         return self.sigma_min + (self.sigma_max - self.sigma_min) * torch.sigmoid(raw)
 
@@ -184,6 +201,28 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
             params.extend(list(self._sigma_head.parameters()))
         return params
 
+    def get_strategy_state_dict(self) -> dict[str, Any]:
+        """Return SigmaHead state dict for checkpoint saving."""
+        state_dict = {}
+        if self._sigma_head is not None:
+            for k, v in self._sigma_head.state_dict().items():
+                state_dict[f"strategy.sigma_head.{k}"] = v
+        return state_dict
+
+    def load_strategy_state_dict(self, state_dict: dict[str, Any]) -> tuple[int, int]:
+        """Load SigmaHead weights from checkpoint."""
+        loaded, skipped = 0, 0
+        if self._sigma_head is not None:
+            sigma_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("strategy.sigma_head."):
+                    sigma_dict[k.replace("strategy.sigma_head.", "")] = v
+            if sigma_dict:
+                self._sigma_head.load_state_dict(sigma_dict)
+                loaded = len(sigma_dict)
+                logger.info(f"Loaded SigmaHead: {loaded} params")
+        return loaded, skipped
+
     def get_data_sources(self) -> list[str] | dict[str, str]:
         """Add trajectories as data source if distillation is enabled."""
         sources = super().get_data_sources()
@@ -196,9 +235,13 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
     def set_noise_adapter(self, adapter) -> None:
         """Override to also move sigma head to adapter's device."""
         super().set_noise_adapter(adapter)
-        if self._sigma_head is not None and adapter is not None:
+        if adapter is not None:
             device = next(adapter.parameters()).device
-            self._sigma_head = self._sigma_head.to(device)
+            # Ensure ALL adapter submodules are on the right device
+            # (quanto quantization can leave some embeddings on CPU)
+            adapter.to(device)
+            if self._sigma_head is not None:
+                self._sigma_head = self._sigma_head.to(device=device)
 
     def prepare_training_inputs(
         self,
@@ -307,8 +350,9 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
         # PER-TOKEN SIGMA (v1d key feature)
         # ════════════════════════════════════════════════
         if cfg.per_token_sigma and self._sigma_head is not None and adapter_mu is not None:
-            # Predict per-token sigma from adapter mu
-            per_token_sigmas = self._sigma_head(adapter_mu.detach())  # [B, seq]
+            # Predict per-token sigma from x₀ + adapter_mu
+            # x₀ provides spatial structure, adapter_mu provides learned noise conditioning
+            per_token_sigmas = self._sigma_head(adapter_mu.float(), x0=video_latents.float())  # [B, seq]
 
             # Zero out sigma for conditioning tokens (first frame)
             per_token_sigmas = per_token_sigmas * (~video_conditioning_mask).float()
@@ -354,6 +398,7 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
 
         video_modality = Modality(
             enabled=True,
+            sigma=sigmas_for_logging,
             latent=noisy_video,
             timesteps=video_timesteps,
             positions=video_positions,
@@ -386,6 +431,9 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
 
         # v1d metadata
         model_inputs._per_token_sigmas = per_token_sigmas
+        model_inputs._sigma_complexity_targets = self._compute_complexity_targets(
+            video_latents, cfg.sigma_min, cfg.sigma_max,
+        ) if per_token_sigmas is not None else None
         model_inputs._distill_mode = "none"
 
         model_inputs.shared_noise = video_noise
@@ -479,7 +527,8 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
 
             if cfg.per_token_sigma and self._sigma_head is not None and adapter_mu is not None:
                 # Per-token sigma even in distill mode
-                per_token_sigmas = self._sigma_head(adapter_mu.detach())
+                # NOTE: no .detach() — gradient flows through sigma head
+                per_token_sigmas = self._sigma_head(adapter_mu.float(), x0=video_latents.float())
                 per_token_sigmas = per_token_sigmas * (~video_conditioning_mask).float()
                 video_timesteps = per_token_sigmas
 
@@ -520,6 +569,7 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
 
         video_modality = Modality(
             enabled=True,
+            sigma=torch.ones(batch_size, device=device, dtype=dtype),
             latent=noisy_video,
             timesteps=video_timesteps,
             positions=video_positions,
@@ -552,6 +602,9 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
 
         # v1d metadata
         model_inputs._per_token_sigmas = per_token_sigmas
+        model_inputs._sigma_complexity_targets = self._compute_complexity_targets(
+            video_latents, cfg.sigma_min, cfg.sigma_max,
+        ) if per_token_sigmas is not None else None
         model_inputs._distill_mode = cfg.distill_mode
         model_inputs._distill_teacher_target = teacher_target if cfg.distill_mode == "output_match" else None
         model_inputs._distill_teacher_x0_gt = teacher_x0_gt
@@ -797,7 +850,7 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
             for f_idx in range(num_frames):
                 fig.add_trace(
                     go.Heatmap(
-                        z=sigma_frames[f_idx].numpy(),
+                        z=sigma_frames[f_idx].detach().cpu().numpy(),
                         colorscale="RdYlBu_r",
                         zmin=0.0, zmax=1.0,
                         showscale=(f_idx == num_frames - 1),
@@ -838,3 +891,52 @@ class VFMv1dTrainingStrategy(VFMv1cTrainingStrategy):
 
         # Negative std → minimizing this maximizes sigma diversity
         return -active_sigmas.std()
+
+    @staticmethod
+    def _compute_complexity_targets(
+        video_latents: Tensor,
+        sigma_min: float,
+        sigma_max: float,
+    ) -> Tensor:
+        """Compute per-token complexity-based sigma targets from clean latent x₀.
+
+        Complex tokens (high local variance / gradient magnitude in latent space)
+        should get higher sigma (more noise → harder denoising task), while simple
+        tokens (flat/static regions) get lower sigma (easier task).
+
+        Args:
+            video_latents: Clean patchified latent x₀ [B, seq_len, C]
+            sigma_min: Minimum sigma value
+            sigma_max: Maximum sigma value
+
+        Returns:
+            Per-token sigma targets [B, seq_len] in [sigma_min, sigma_max]
+        """
+        # Per-token L2 norm as complexity proxy — tokens with larger norms
+        # tend to encode more complex content (edges, texture, motion)
+        token_norms = video_latents.float().norm(dim=-1)  # [B, seq_len]
+
+        # Compute local variance: difference from spatial neighbors
+        # Adjacent tokens in the sequence correspond to nearby spatial/temporal patches
+        # Use absolute difference to neighbors as a gradient proxy
+        diff_fwd = (video_latents[:, 1:] - video_latents[:, :-1]).norm(dim=-1)  # [B, seq-1]
+        diff_bwd = (video_latents[:, :-1] - video_latents[:, 1:]).norm(dim=-1)  # [B, seq-1]
+        # Pad to match seq_len
+        local_grad = torch.zeros_like(token_norms)
+        local_grad[:, :-1] += diff_fwd
+        local_grad[:, 1:] += diff_bwd
+        local_grad[:, 1:-1] /= 2.0  # Average forward/backward for interior tokens
+
+        # Combine norm and gradient (both indicate complexity)
+        complexity = 0.5 * token_norms + 0.5 * local_grad
+
+        # Normalize per-sample to [0, 1] range
+        c_min = complexity.min(dim=1, keepdim=True).values
+        c_max = complexity.max(dim=1, keepdim=True).values
+        c_range = (c_max - c_min).clamp(min=1e-6)
+        complexity_01 = (complexity - c_min) / c_range
+
+        # Map to [sigma_min, sigma_max]
+        targets = sigma_min + (sigma_max - sigma_min) * complexity_01
+
+        return targets.detach()  # No gradient through targets
