@@ -1,20 +1,13 @@
 """RotorQuant-compressed attention for LTX-2.
 
-v0a: Vanilla LTX-2 (no SCD) — compresses K/V tensors in-flight during
-attention computation to reduce peak activation memory.
-
-Instead of storing full-precision K/V tensors (B, seq_len, 4096) during
-the attention forward pass, we compress them via RotorQuant (Clifford
-rotor rotation + Lloyd-Max quantization) and decompress just before
-the dot product. This reduces activation memory by ~3-5x.
-
-The compression/decompression adds a small overhead but enables:
-- Larger batch sizes at the same VRAM
-- Higher resolution / more frames
-- Longer sequences without OOM
+Optimized implementation:
+- Operates on full (B, S, H*D) tensors — no per-head Python loop
+- Uses searchsorted for O(n log k) quantization instead of O(n*k) argmin
+- Precomputes boundaries from sorted centroids
+- Stores fp16 norms instead of fp32
+- Single einsum for all heads simultaneously
 
 Usage:
-    # Monkey-patch after model load:
     from ltx_core.model.transformer.rotorquant_attention import enable_rotorquant
     enable_rotorquant(model, bits=3)
 """
@@ -22,48 +15,47 @@ Usage:
 import math
 import torch
 import torch.nn as nn
-from typing import Optional
 
 
 class RotorQuantCompressor(nn.Module):
-    """Lightweight RotorQuant compressor for attention K/V tensors.
+    """Fast RotorQuant compressor for attention K/V tensors.
 
-    Operates per-head: each head's dim_head dimensions are chunked into
-    groups of 3, rotated by precomputed 3x3 matrices (derived from Clifford
-    rotors), quantized via Lloyd-Max, then stored as uint8 indices + scale.
-
-    Uses the batched 3x3 matmul trick (SO(3) isomorphism) for speed on GPU.
+    Operates on full (B, S, H*D) — groups dims across ALL heads simultaneously.
+    Uses searchsorted (binary search) instead of argmin (linear scan) for quantization.
     """
 
-    def __init__(self, dim_head: int, bits: int = 3, seed: int = 42):
+    def __init__(self, dim: int, bits: int = 3, seed: int = 42):
+        """
+        Args:
+            dim: FULL hidden dim (H*D), e.g. 4096 for 32 heads × 128 dim_head
+            bits: quantization bits
+        """
         super().__init__()
-        self.dim_head = dim_head
+        self.dim = dim
         self.bits = bits
-        self.n_groups = (dim_head + 2) // 3
+        self.n_groups = (dim + 2) // 3
         self.n_levels = 2 ** bits
 
-        # Build rotation matrices from Clifford rotors
+        # Build rotation matrices from Clifford rotors — one per group across all heads
         rng = torch.Generator()
         rng.manual_seed(seed)
-
-        # Random rotor → 3x3 rotation matrix per group
         rotors = torch.randn(self.n_groups, 4, generator=rng)
-        # Normalize to unit rotors
         rotors = rotors / rotors.norm(dim=-1, keepdim=True)
         M = self._rotors_to_matrices(rotors)
-        self.register_buffer('M', M)  # (n_groups, 3, 3)
-        self.register_buffer('Mt', M.transpose(1, 2).contiguous())  # inverse
+        self.register_buffer('M', M)          # (n_groups, 3, 3)
+        self.register_buffer('Mt', M.transpose(1, 2).contiguous())
 
-        # Lloyd-Max centroids for Gaussian N(0, 1/d)
-        centroids = self._compute_centroids(bits, dim_head)
-        self.register_buffer('centroids', centroids)  # (n_levels,)
+        # Lloyd-Max centroids (sorted for searchsorted)
+        centroids = self._compute_centroids(bits, dim)
+        self.register_buffer('centroids', centroids)  # (n_levels,) sorted
+        # Precompute boundaries (midpoints between adjacent centroids)
+        boundaries = (centroids[:-1] + centroids[1:]) / 2
+        self.register_buffer('boundaries', boundaries)  # (n_levels-1,)
 
     @staticmethod
     def _rotors_to_matrices(rotors: torch.Tensor) -> torch.Tensor:
-        """Convert rotor [s, b12, b13, b23] to 3x3 rotation matrix."""
         s, p, q, r = rotors[:, 0], rotors[:, 1], rotors[:, 2], rotors[:, 3]
         s2, p2, q2, r2 = s**2, p**2, q**2, r**2
-
         M = torch.zeros(rotors.shape[0], 3, 3)
         M[:, 0, 0] = s2 - p2 - q2 + r2
         M[:, 0, 1] = 2*s*p - 2*q*r
@@ -78,29 +70,25 @@ class RotorQuantCompressor(nn.Module):
 
     @staticmethod
     def _compute_centroids(bits: int, d: int) -> torch.Tensor:
-        """Compute Lloyd-Max centroids for N(0, 1/d)."""
-        sigma = 1.0 / math.sqrt(d)
+        sigma = 1.0 / math.sqrt(max(d, 64))
         n = 2 ** bits
         if bits == 1:
             c = math.sqrt(2.0 / math.pi) * sigma
             return torch.tensor([-c, c])
-        # Uniform initialization, good enough for 2-4 bit
         return torch.linspace(-3 * sigma, 3 * sigma, n)
 
-    def compress(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compress K or V tensor.
+    @torch.no_grad()
+    def compress(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Compress tensor. x: (B, S, D) where D = H*dim_head.
 
-        Args:
-            x: (B, seq_len, dim_head) — one head's K or V
-
-        Returns:
-            indices: (B, seq_len, n_groups * 3) uint8 quantization indices
-            norms: (B, seq_len) vector norms for rescaling
-            x_shape: original shape for unpadding
+        Returns: (indices uint8, norms fp16, orig_dim)
         """
         B, S, D = x.shape
-        norms = x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        x_unit = x / norms
+
+        # Norms — store as fp16 to save memory
+        norms = x.norm(dim=-1).to(torch.float16)  # (B, S)
+        safe_norms = norms.float().clamp(min=1e-8)
+        x_unit = x / safe_norms.unsqueeze(-1)
 
         # Pad to multiple of 3
         pad = (3 - D % 3) % 3
@@ -110,52 +98,35 @@ class RotorQuantCompressor(nn.Module):
         # Reshape to groups: (B, S, n_groups, 3)
         x_groups = x_unit.reshape(B, S, -1, 3)
 
-        # Rotate via 3x3 matmul: (B, S, n_groups, 3) @ (n_groups, 3, 3)
+        # Rotate ALL groups in one einsum — no per-head loop
         rotated = torch.einsum('bsgi,gij->bsgj', x_groups, self.M)
 
-        # Quantize: find nearest centroid
-        flat = rotated.reshape(B, S, -1)
-        indices = (flat.unsqueeze(-1) - self.centroids).abs().argmin(dim=-1).to(torch.uint8)
+        # Quantize via searchsorted: O(n log k) instead of O(n*k)
+        flat = rotated.reshape(B * S, -1)  # (B*S, n_groups*3)
+        indices = torch.searchsorted(self.boundaries, flat).clamp(0, self.n_levels - 1)
+        indices = indices.to(torch.uint8).reshape(B, S, -1)
 
-        return indices, norms.squeeze(-1), D
+        return indices, norms, D
 
+    @torch.no_grad()
     def decompress(self, indices: torch.Tensor, norms: torch.Tensor, orig_dim: int) -> torch.Tensor:
-        """Decompress back to K or V tensor.
-
-        Args:
-            indices: (B, seq_len, n_groups * 3) uint8
-            norms: (B, seq_len) norms
-            orig_dim: original dim_head
-
-        Returns:
-            (B, seq_len, dim_head)
-        """
+        """Decompress. Returns (B, S, D)."""
         B, S, _ = indices.shape
 
         # Dequantize
-        flat = self.centroids[indices.long()]  # (B, S, n_groups * 3)
+        flat = self.centroids[indices.long()]  # (B, S, n_groups*3)
         groups = flat.reshape(B, S, -1, 3)
 
-        # Inverse rotate
+        # Inverse rotate — one einsum
         derotated = torch.einsum('bsgi,gij->bsgj', groups, self.Mt)
 
-        # Flatten and trim
+        # Flatten, trim, rescale
         out = derotated.reshape(B, S, -1)[:, :, :orig_dim]
-
-        # Rescale
-        return out * norms.unsqueeze(-1)
+        return out * norms.float().unsqueeze(-1)
 
 
 class RotorQuantAttention(nn.Module):
-    """Drop-in wrapper that compresses K/V before attention.
-
-    Wraps the original attention function to:
-    1. Compress K and V after projection + RoPE
-    2. Decompress just before the dot product
-    3. The compression/decompression reduces peak activation memory
-
-    For inference only — not differentiable through the quantization.
-    """
+    """Drop-in attention wrapper with K/V compression."""
 
     def __init__(self, original_attention: nn.Module, bits: int = 3, compress_values: bool = True):
         super().__init__()
@@ -163,34 +134,17 @@ class RotorQuantAttention(nn.Module):
         self.bits = bits
         self.compress_values = compress_values
 
-        # Create compressor matching head dim
-        self.k_compressor = RotorQuantCompressor(
-            original_attention.dim_head, bits=bits, seed=42
-        )
-        if compress_values:
-            self.v_compressor = RotorQuantCompressor(
-                original_attention.dim_head, bits=bits, seed=4200
-            )
-        else:
-            self.v_compressor = None
+        inner_dim = original_attention.heads * original_attention.dim_head
+        self.k_compressor = RotorQuantCompressor(inner_dim, bits=bits, seed=42)
+        self.v_compressor = RotorQuantCompressor(inner_dim, bits=bits, seed=4200) if compress_values else None
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        context: torch.Tensor | None = None,
-        mask: torch.Tensor | None = None,
-        pe: torch.Tensor | None = None,
-        k_pe: torch.Tensor | None = None,
-        perturbation_mask: torch.Tensor | None = None,
-        all_perturbed: bool = False,
-    ) -> torch.Tensor:
-        """Forward with K/V compression."""
+    def forward(self, x, context=None, mask=None, pe=None, k_pe=None,
+                perturbation_mask=None, all_perturbed=False):
         from ltx_core.model.transformer.rope import apply_rotary_emb
 
         attn = self.original
         context = x if context is None else context
         use_attention = not all_perturbed
-
         v = attn.to_v(context)
 
         if not use_attention:
@@ -198,42 +152,27 @@ class RotorQuantAttention(nn.Module):
         else:
             q = attn.to_q(x)
             k = attn.to_k(context)
-
             q = attn.q_norm(q)
             k = attn.k_norm(k)
-
             if pe is not None:
                 q = apply_rotary_emb(q, pe, attn.rope_type)
                 k = apply_rotary_emb(k, pe if k_pe is None else k_pe, attn.rope_type)
 
-            # ── RotorQuant compression ──
-            B, T, HD = k.shape
-            heads = attn.heads
-            dim_head = attn.dim_head
-
-            # Reshape to per-head: (B, T, H, D) -> (B*H, T, D)
-            k_heads = k.view(B, T, heads, dim_head).permute(0, 2, 1, 3).reshape(B * heads, T, dim_head)
-            k_idx, k_norms, k_orig_dim = self.k_compressor.compress(k_heads)
-            k_decompressed = self.k_compressor.decompress(k_idx, k_norms, k_orig_dim)
-            k = k_decompressed.reshape(B, heads, T, dim_head).permute(0, 2, 1, 3).reshape(B, T, HD)
+            # Compress/decompress K (operates on full H*D tensor — no per-head loop)
+            k_idx, k_norms, k_dim = self.k_compressor.compress(k)
+            k = self.k_compressor.decompress(k_idx, k_norms, k_dim)
+            del k_idx, k_norms
 
             if self.compress_values and self.v_compressor is not None:
-                v_heads = v.view(B, T, heads, dim_head).permute(0, 2, 1, 3).reshape(B * heads, T, dim_head)
-                v_idx, v_norms, v_orig_dim = self.v_compressor.compress(v_heads)
-                v_decompressed = self.v_compressor.decompress(v_idx, v_norms, v_orig_dim)
-                v = v_decompressed.reshape(B, heads, T, dim_head).permute(0, 2, 1, 3).reshape(B, T, HD)
-
-            # Delete compressed indices to free memory immediately
-            del k_idx, k_norms
-            if self.compress_values:
+                v_idx, v_norms, v_dim = self.v_compressor.compress(v)
+                v = self.v_compressor.decompress(v_idx, v_norms, v_dim)
                 del v_idx, v_norms
 
-            out = attn.attention_function(q, k, v, heads, mask)
-
+            out = attn.attention_function(q, k, v, attn.heads, mask)
             if perturbation_mask is not None:
-                out = out * perturbation_mask + attn.to_v(context) * (1 - perturbation_mask)
+                v_raw = attn.to_v(context)
+                out = out * perturbation_mask + v_raw * (1 - perturbation_mask)
 
-        # Per-head gating
         if attn.to_gate_logits is not None:
             gate_logits = attn.to_gate_logits(x)
             b, t, _ = out.shape
@@ -247,23 +186,12 @@ class RotorQuantAttention(nn.Module):
 
 def enable_rotorquant(model: nn.Module, bits: int = 3, compress_values: bool = True,
                       layers: list[int] | None = None) -> int:
-    """Monkey-patch all Attention modules in an LTX model with RotorQuant compression.
-
-    Args:
-        model: LTXModel or LTXSCDModel
-        bits: Quantization bits (2, 3, or 4)
-        compress_values: Whether to also compress V (True for max savings)
-        layers: Optional list of layer indices to compress (None = all)
-
-    Returns:
-        Number of attention modules patched
-    """
+    """Monkey-patch Attention modules with RotorQuant compression."""
     from ltx_core.model.transformer.attention import Attention
 
     patched = 0
-    for name, module in model.named_modules():
+    for name, module in list(model.named_modules()):
         if isinstance(module, Attention):
-            # Check if this is in a targeted layer
             if layers is not None:
                 layer_idx = None
                 for part in name.split('.'):
@@ -273,7 +201,6 @@ def enable_rotorquant(model: nn.Module, bits: int = 3, compress_values: bool = T
                 if layer_idx is not None and layer_idx not in layers:
                     continue
 
-            # Wrap with RotorQuant
             parent_name = '.'.join(name.split('.')[:-1])
             attr_name = name.split('.')[-1]
             parent = model
@@ -282,12 +209,10 @@ def enable_rotorquant(model: nn.Module, bits: int = 3, compress_values: bool = T
                     parent = getattr(parent, p)
 
             wrapper = RotorQuantAttention(module, bits=bits, compress_values=compress_values)
-            # Move compressor buffers to same device as attention weights
             device = module.to_q.weight.device
             wrapper.k_compressor = wrapper.k_compressor.to(device)
             if wrapper.v_compressor is not None:
                 wrapper.v_compressor = wrapper.v_compressor.to(device)
-
             setattr(parent, attr_name, wrapper)
             patched += 1
 

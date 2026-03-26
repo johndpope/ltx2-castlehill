@@ -36,23 +36,21 @@ training_strategy:
   self_eval_cfg_scale: 5.0
   self_eval_s_range: [0.1, 0.5]
   energy_preserving_norm: true
-  self_eval_prob: 1.0             # ALWAYS apply self-eval (0.5 = skip half = wasted steps)
+  self_eval_prob: 0.75            # 75% self-eval + 25% pure data (Grok: mix is better)
 
-  # Observation loss (forces text-conditioned adapter noise)
-  obs_loss_weight: 25.0
+  # Observation loss (low weight — Self-E provides text alignment)
+  obs_loss_weight: 2.0            # Was 25 (dominated everything). Grok: use 1-2
   obs_noise_level: 0.2
 
   # Perceptual loss
-  latent_perceptual_weight: 1.0
+  latent_perceptual_weight: 0.5   # Grok: 0.5
 
-  # mu→x₀ alignment (anti-collapse)
-  mu_align_weight: 5.0
+  # mu alignment + diversity DISABLED (Grok: Self-E handles alignment, these add gradient noise)
+  mu_align_weight: 0.0
   mu_align_warmup_steps: 0
-
-  # Diversity
-  diversity_weight: 0.2
-  temporal_diversity_weight: 0.2
-  spatial_diversity_weight: 0.1
+  diversity_weight: 0.0
+  temporal_diversity_weight: 0.0
+  spatial_diversity_weight: 0.0
   diversity_warmup_steps: 0
 
   # gt reconstruction

@@ -96,7 +96,7 @@ def benchmark_roundtrip_fidelity():
 
     for bits in [2, 3, 4]:
         for seq_len in [1024, 4096]:
-            cache = RotorQuantKVCache.empty(bits=bits, dim_head=dim_head, num_heads=heads)
+            cache = RotorQuantKVCache.empty(bits=bits, hidden_dim=heads * dim_head)
             cache.is_cache_step = True
 
             # Simulate K/V from attention projection (not random — has structure)
@@ -166,7 +166,7 @@ def benchmark_autoregressive_simulation():
 
     for label, CacheClass, kwargs in [
         ("FP16", KVCache, {}),
-        ("RQ-3bit", RotorQuantKVCache, {"bits": 3, "dim_head": dim_head, "num_heads": heads}),
+        ("RQ-3bit", RotorQuantKVCache, {"bits": 3, "hidden_dim": heads * dim_head}),
     ]:
         if CacheClass == KVCache:
             cache = KVCache.empty()
@@ -287,7 +287,7 @@ def benchmark_attention_quality():
             q = torch.randn(batch, new_len, hidden_dim, device=device) * 0.1
 
             # Compress cached K/V through RotorQuant
-            rq_cache = RotorQuantKVCache.empty(bits=bits, dim_head=dim_head, num_heads=heads)
+            rq_cache = RotorQuantKVCache.empty(bits=bits, hidden_dim=heads * dim_head)
             rq_cache.is_cache_step = True
             rq_cache.update_from_layer_cache({
                 "keys": k_cached, "values": v_cached,

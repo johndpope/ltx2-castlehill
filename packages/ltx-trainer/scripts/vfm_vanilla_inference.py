@@ -307,7 +307,7 @@ def main():
         print(f"\n[3b/5] Loading SigmaHead from {sigma_head_path}...")
         from ltx_trainer.training_strategies.vfm_strategy_v1d import SigmaHead  # noqa: PLC0415
         sigma_head = SigmaHead(
-            input_dim=latent_channels,
+            latent_dim=latent_channels,
             hidden_dim=args.sigma_head_hidden_dim,
         ).to(device=device)
         sigma_sd = load_file(sigma_head_path)
