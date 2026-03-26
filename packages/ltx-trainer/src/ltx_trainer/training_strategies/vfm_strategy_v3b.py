@@ -282,14 +282,15 @@ class SelfEVFMv3bTrainingStrategy(VFMv1fTrainingStrategy):
             s = random.uniform(s_min, s_max)
 
             # Flow matching coefficients: α_t = 1-t, σ_t = t
-            # For VFM 1-step: t ≈ 1 (starting from pure noise)
-            t = 1.0  # VFM operates at t=1 (full noise → clean)
-            alpha_t, sigma_t = 1 - t + 1e-6, t  # avoid div by zero
+            # Use t=0.8 instead of 1.0 to avoid lambda explosion
+            # (t=1.0 → lambda=1e6, clamped to 10 — too aggressive)
+            t = 0.8  # Late-stage distillation (Grok recommendation)
+            alpha_t, sigma_t = 1 - t, t
             alpha_s, sigma_s = 1 - s, s
 
             # λ_{s,t} = σ_t/α_t - σ_s/α_s (Eq. 17)
             lambda_st = sigma_t / alpha_t - sigma_s / alpha_s
-            lambda_st = min(lambda_st, 10.0)  # Clamp to prevent explosion
+            # With t=0.8, s=0.3: lambda ≈ 4-0.43 = 3.57 (reasonable)
 
             # Get self-evaluation pseudo-target
             x_self = self._self_evaluate(
@@ -307,9 +308,9 @@ class SelfEVFMv3bTrainingStrategy(VFMv1fTrainingStrategy):
                 # Simple weighted average (Eq. 18)
                 x_target = (video_latents + lambda_st * x_self) / (1 + lambda_st)
 
-            # Self-evaluation loss
+            # Self-evaluation loss — ADD to total, don't replace data_loss
             loss_self_eval = (x_hat_0 - x_target).pow(2).mean()
-            total_loss = loss_self_eval  # Replace data loss with combined target
+            total_loss = total_loss + cfg.self_eval_weight * loss_self_eval
 
         # ════════════════════════════════════════════════════════════
         # ADAPTER KL (from v1f)
