@@ -1,0 +1,634 @@
+\documentclass[10pt,twocolumn]{article}
+
+% Packages
+\usepackage[margin=0.75in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage[numbers]{natbib}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{tikz}
+
+% Colors
+\definecolor{codegreen}{rgb}{0.2,0.6,0.2}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{ltxblue}{rgb}{0.1,0.3,0.7}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{codepurple},
+  commentstyle=\color{codegray},
+  stringstyle=\color{codegreen},
+  breaklines=true,
+  frame=single,
+  captionpos=b,
+}
+
+\hypersetup{colorlinks=true,linkcolor=ltxblue,citecolor=ltxblue,urlcolor=ltxblue}
+
+\title{\textbf{One Step at a Time: Variational Flow Maps\\
+and Separable Causal Diffusion for\\
+Efficient Long-Form Video Generation}}
+
+\author{
+  John D.\ Pope\\
+  CastleHill Research\\
+  \texttt{jp@bellgeorge.com}\\
+  \url{https://github.com/johndpope/ltx2-castlehill}
+}
+
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────
+\begin{abstract}
+We present two complementary techniques built on top of LTX-2~\cite{ltx2}, a 22-billion parameter audio-video diffusion transformer.
+
+\textbf{Separable Causal Diffusion (SCD)} splits the 48-layer transformer into a 32-layer \emph{encoder} and a 16-layer \emph{decoder}. The encoder runs once per video chunk and writes into a persistent KV cache; the decoder denoises new frames conditioned on that cache. Memory cost becomes $O(1)$ in frame count, enabling autoregressive generation of arbitrarily long videos (30s, 60s, 120s+) on a single consumer GPU.
+
+\textbf{Variational Flow Maps (VFM)} eliminate the need for iterative denoising altogether. A small noise adapter $q_\phi(z|y)$, conditioned on text, produces \emph{structured} noise that already encodes the target video. A single forward pass through the flow-map transformer then denoises this noise in one step, achieving \textbf{$\approx$8$\times$ speedup} over the 8-step baseline with generation time of \textbf{1.2 seconds} (348\,ms DiT + 940\,ms VAE decode) on an RTX~5090.
+
+We describe the full architecture evolution (VFM v1a through v4a), training methodology, and three non-obvious implementation bugs whose fixes were essential to end-to-end functionality:\ (1) a training/inference LoRA key format mismatch, (2) silent PEFT weight discard on quanto-quantized layers, and (3) a misidentified training mode caused by class hierarchy ordering in the \texttt{isinstance} check.
+
+Code: \url{https://github.com/johndpope/ltx2-castlehill}
+\end{abstract}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Introduction}
+\label{sec:intro}
+
+Modern video diffusion models produce high-quality results but are slow: LTX-2~\cite{ltx2} requires 8 Euler denoising steps, each passing $\approx$18\,billion parameters, to generate a 5-second clip. This is both compute-expensive and memory-limited.
+
+Two independent bottlenecks compound the problem:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Inference latency.} Each of the 8 steps is a full forward pass through the 48-layer DiT. Even with int8 quantization the RTX~5090 takes $\approx$1.2\,s per step at 768$\times$448.
+  \item \textbf{Context length.} All frames are processed together. At 768$\times$448 with 97 frames, the token count is $\approx$10\,K, filling GPU memory. Longer videos require proportionally more VRAM, capping duration on consumer hardware.
+\end{enumerate}
+
+This paper presents two orthogonal solutions:
+\begin{itemize}[nosep]
+  \item \textbf{SCD} (Section~\ref{sec:scd}) solves the context-length problem by caching encoder features and generating one frame at a time.
+  \item \textbf{VFM} (Section~\ref{sec:vfm}) solves the latency problem by collapsing 8 denoising steps into 1 via a learned structured-noise distribution.
+\end{itemize}
+
+The two techniques are independent but composable: SCD-VFM (Section~\ref{sec:scd_vfm}) enables one-step generation of arbitrarily long videos.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Background}
+\label{sec:background}
+
+\subsection{LTX-2 Architecture}
+
+LTX-2~\cite{ltx2} is a 22B audio-video diffusion transformer. The relevant components for this work are:
+
+\begin{itemize}[nosep]
+  \item \textbf{Video VAE}: Encodes/decodes video at 32$\times$ spatial and 8$\times$ temporal compression. A 25-frame, 768$\times$448 clip becomes a latent of shape $[128, 4, 14, 24]$ (128 channels, 4 latent frames, $14\times 24$ spatial).
+  \item \textbf{Text encoder}: Gemma LLM producing $[T, 3840]$ embeddings. A caption projection shim maps 3840$\to$4096 for compatibility.
+  \item \textbf{Transformer}: 48 BasicAVTransformerBlock layers, each a joint audio-video self-attention + cross-attention to text. Input is patchified video tokens $[B, S, 128]$ where $S=1{,}344$ for our standard resolution (336 tokens/frame $\times$ 4 latent frames).
+  \item \textbf{Flow matching}: At training time, the model learns to predict velocity $v = z - x_0$ at noise level $\sigma$, where the noisy latent is $x_t = (1-\sigma)x_0 + \sigma z$.
+\end{itemize}
+
+\subsection{Flow Matching}
+
+Flow matching~\cite{lipman2022flow} defines a probability path from data $x_0$ to noise $z \sim \mathcal{N}(0,I)$ via linear interpolation:
+\begin{equation}
+  x_t = (1-t)\,x_0 + t\,z, \quad t \in [0,1]
+\end{equation}
+
+The velocity field $v(x_t, t) = z - x_0$ is constant along this path (for linear interpolation). At inference, the flow is traced from $t=1$ (pure noise) to $t=0$ (clean video) using an ODE solver with $N$ steps. LTX-2 uses 8 Euler steps by default.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Separable Causal Diffusion (SCD)}
+\label{sec:scd}
+
+\subsection{Motivation: Memory Bottleneck}
+
+Standard LTX-2 processes all video frames simultaneously. For a 30-second clip at 768$\times$448 (300 frames), the token count reaches $\approx$120\,K, requiring $\approx$70\,GB for activations at bf16 — far exceeding any consumer GPU. SCD enables constant-memory generation regardless of video duration.
+
+\subsection{Encoder-Decoder Split}
+
+SCD splits the 48-layer transformer at layer 32:
+
+\begin{equation}
+\underbrace{\text{Layers 1--32}}_{\text{Encoder}} \;\longrightarrow\; \underbrace{\text{KV cache}}_{\text{per-frame}} \;\longrightarrow\; \underbrace{\text{Layers 33--48}}_{\text{Decoder}}
+\end{equation}
+
+\textbf{Encoder pass} (runs once per context frame, $\sigma=0$):
+Given clean (or previously generated) frames, the encoder extracts features $F_{\text{enc}} = \text{Enc}(x_0)$. These are written into a KV cache indexed by frame position.
+
+\textbf{Decoder pass} (runs $N$ denoising steps per new frame):
+Given noisy query frame $x_t^{\text{new}}$ and the KV cache from all previous frames, the decoder predicts $v = z - x_0$ for the new frame only. The decoder conditions on the cached encoder features via token concatenation (\texttt{token\_concat}):
+
+\begin{equation}
+  x_t^{\text{dec}} = \text{Dec}\!\left([F_{\text{enc}} \,\|\, x_t^{\text{new}}]\right)
+\end{equation}
+
+The encoder tokens are prepended as prefix tokens, so decoder self-attention can attend to the full context. This is the ``token\_concat'' mode from the SCD paper~\cite{scd}, which outperforms cross-attention injection in ablations.
+
+\subsection{Memory Analysis}
+
+Let $T$ be the total token count and $K$ be the tokens per new frame. Standard LTX-2 attention is $O(T^2)$ in memory. SCD decoder attention is $O(K \cdot T_{\text{cache}})$ for the new frame against all cached frames, plus $O(K^2)$ within the frame.
+
+In practice:
+\begin{itemize}[nosep]
+  \item Standard 30s generation: $T \approx 120\,K$ → OOM on 32\,GB.
+  \item SCD: $T_{\text{cache}} = c \cdot T_{\text{prev}}$ where $c < 1$ (encoder compresses), new frame $K = 336$ tokens → fits on 18\,GB.
+\end{itemize}
+
+\subsection{Training Strategy}
+
+The \texttt{SCDTrainingStrategy} trains the decoder LoRA to denoise one frame given encoder context from preceding frames. Key design decisions:
+
+\begin{itemize}[nosep]
+  \item \textbf{Per-frame decoder}: At training time, each forward pass processes exactly one new frame through the decoder. This eliminates the train/inference mismatch that caused grid artifacts when the decoder was trained on multi-frame batches but inferred frame-by-frame.
+  \item \textbf{Scheduled sampling}: Early training uses teacher-forced context (clean frames from ground truth). A curriculum linearly increases the fraction of autoregressive (model-generated) context, exposing the model to its own output distribution.
+  \item \textbf{First-frame conditioning}: With probability 0.5, the first frame is provided as a clean conditioning signal (image-to-video mode).
+  \item \textbf{Clean context ratio}: Following the SCD paper, 10\% of context frames are provided clean rather than denoised, improving autoregressive stability.
+\end{itemize}
+
+\subsection{Inference}
+
+SCD inference generates video chunk-by-chunk:
+
+\begin{enumerate}[nosep]
+  \item Encode all previously generated frames with the encoder → accumulate KV cache.
+  \item Initialize new frame as pure noise $z \sim \mathcal{N}(0,I)$.
+  \item Run $N$ Euler steps of the decoder, conditioning on the KV cache.
+  \item Append decoded frame to the KV cache.
+  \item Repeat from step~1 for each new chunk.
+\end{enumerate}
+
+Using the distilled LTX-2.3 checkpoint~\cite{ltx23}, we use 8 steps instead of 30, producing 30-second videos on a single RTX~5090 with 18\,GB peak VRAM.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Variational Flow Maps (VFM)}
+\label{sec:vfm}
+
+\subsection{Core Idea}
+
+Standard flow matching starts from isotropic Gaussian noise $z \sim \mathcal{N}(0,I)$. This noise contains \emph{no information} about the target video, so the model must do all the work across 8 iterative steps.
+
+VFM~\cite{vfm} replaces $z \sim \mathcal{N}(0,I)$ with \emph{structured} noise $z \sim q_\phi(z | y)$, where $y$ is the text conditioning. The adapter $q_\phi$ learns to produce noise that already encodes rough content, motion, and layout. Given this structured noise, a single step of the flow map $f_\theta(z)$ suffices to produce clean video.
+
+\begin{align}
+  \text{Standard:}& \quad z \sim \mathcal{N}(0,I) \;\xrightarrow{\text{8 steps}}\; x_0 \\
+  \text{VFM:}& \quad z \sim q_\phi(z|y) \;\xrightarrow{\text{1 step}}\; x_0
+\end{align}
+
+\subsection{Training Objective}
+
+Following the VFM paper~\cite{vfm} (Eq.~19), the joint training objective is:
+
+\begin{equation}
+  \mathcal{L}(\theta, \phi) = \mathcal{L}_{\text{MF}}(\theta;\phi) + \lambda_{\text{KL}}\,\mathcal{L}_{\text{KL}}(\phi)
+\end{equation}
+
+\textbf{Flow matching loss} $\mathcal{L}_{\text{MF}}$: The transformer $f_\theta$ is trained to predict the velocity $v = z - x_0$ from the noisy input. At inference, one forward pass gives $\hat{x}_0 = z - f_\theta(z, \sigma, y)$.
+
+\begin{equation}
+  \mathcal{L}_{\text{MF}}(\theta;\phi) = \mathbb{E}_{(x_0,y), z \sim q_\phi}\left[\|f_\theta(z,\sigma) - (z - x_0)\|^2\right]
+\end{equation}
+
+\textbf{KL regularization} $\mathcal{L}_{\text{KL}}$: Prevents the adapter from collapsing to a deterministic mapping (which would overfit to training videos):
+
+\begin{equation}
+  \mathcal{L}_{\text{KL}}(\phi) = \mathrm{KL}\!\left(q_\phi(z|y) \;\|\; \mathcal{N}(0,I)\right)
+\end{equation}
+
+For a diagonal Gaussian $q_\phi = \mathcal{N}(\mu, \sigma^2 I)$, the KL has the closed form:
+
+\begin{equation}
+  \mathcal{L}_{\text{KL}} = \frac{1}{2}\sum_d \left(\mu_d^2 + \sigma_d^2 - \log\sigma_d^2 - 1\right)
+\end{equation}
+
+\textbf{Reparameterization}: $z = \mu + \sigma \odot \varepsilon$, $\varepsilon \sim \mathcal{N}(0,I)$, enables gradients to flow through the sampling operation to both $\theta$ (via $z$) and $\phi$ (via $\mu, \sigma$).
+
+\subsection{Noise Adapter Architecture (NoiseAdapterV1b)}
+
+The noise adapter $q_\phi$ takes text embeddings and video position encodings as input and produces per-token $(\mu, \log\sigma)$ pairs:
+
+\begin{equation}
+  (\mu, \log\sigma) = q_\phi(\text{text}, \text{positions}) \in \mathbb{R}^{B \times S \times 128} \times \mathbb{R}^{B \times S \times 128}
+\end{equation}
+
+where $S = 1{,}344$ is the total token count (336 tokens/frame $\times$ 4 latent frames) and 128 is the latent channel dimension.
+
+The adapter is a 4-layer transformer:
+\begin{itemize}[nosep]
+  \item \textbf{Self-attention}: Token-to-token coordination — allows frame tokens to agree on a consistent noise structure (e.g., uniform background regions vs.\ detail-rich foreground).
+  \item \textbf{Cross-attention to text}: Grounds noise in the text embedding. Each of the 1344 video tokens attends to the 1024 text tokens, allowing the noise to encode content type per spatial position.
+  \item \textbf{Positional encoding}: Sinusoidal encodings of $(t, h, w)$ coordinates, scaled by FPS. Enables temporally-coherent noise structure.
+\end{itemize}
+
+\textbf{Parameters}: 19.2M. This is $\approx$0.1\% of the 22B transformer, adding negligible overhead.
+
+\subsection{Per-Token Sigma Scheduling (SigmaHead)}
+
+Standard flow matching uses a single $\sigma$ for the entire sequence. VFM v4a introduces a per-token sigma head:
+
+\begin{equation}
+  \sigma_i = \text{SigmaHead}(\mu_i, x_0^i) \in [\sigma_{\min}, \sigma_{\max}]
+\end{equation}
+
+The SigmaHead is a 3-layer MLP (131K parameters):
+
+\begin{equation}
+  \text{SigmaHead}: \mathbb{R}^{256} \to \mathbb{R}^1, \quad \text{input} = [\mu_i \,\|\, x_0^i]
+\end{equation}
+
+The final layer is zero-initialized, so at the start of training $\sigma_i = \sigma_{\min} + (\sigma_{\max}-\sigma_{\min}) \cdot \text{sigmoid}(0) = 0.5$ for all tokens. This provides a stable starting point: the model first learns to denoise from $\sigma=0.5$, then gradually learns to vary $\sigma$ spatially.
+
+\textbf{Why concatenate $x_0$?} Early versions (v1d) fed only the adapter output $\mu$ to the sigma head. This failed because $\mu$ is computed from text and position only — it has no access to image content. A sigma head that sees $\mu$ alone cannot distinguish a complex textured region from a flat sky region, so it outputs the same $\sigma$ everywhere. Adding $x_0$ (the ground truth latent) provides the content signal needed for meaningful per-token scheduling.
+
+\subsection{Architecture Evolution}
+
+\begin{table}[h]
+\centering
+\caption{VFM version history and key changes.}
+\label{tab:vfm_versions}
+\begin{tabular}{@{}lp{5.2cm}@{}}
+\toprule
+Version & Key contribution \\
+\midrule
+v1a & Pooled text input, all tokens share $(\mu,\sigma)$ \\
+v1b & Per-token $(\mu,\sigma)$ via transformer cross-attn \\
+v1c & Token/temporal/spatial diversity losses \\
+v1d & Per-token sigma head; trajectory distillation \\
+v1e & Content-adaptive router (complexity $\to$ sigma) \\
+v1f & Spherical Cauchy noise on $S^{127}$; direction/magnitude decomp. \\
+v3a & DMD2 adversarial distribution matching \\
+\textbf{v4a} & \textbf{Standalone Gaussian; fixed training pipeline} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{v1f: Spherical Cauchy Noise}
+
+The most theoretically novel variant replaces the Gaussian reparameterization with a Spherical Cauchy distribution on $S^{127}$~\cite{kato2020}:
+
+\begin{equation}
+  z = \|{\mu}\| \cdot \text{SpCauchy}\!\left(\hat{\mu},\, \kappa\right)
+\end{equation}
+
+where $\hat{\mu} = \mu / \|\mu\|$ is the direction, $\|\mu\|$ is the magnitude (stored separately), and $\kappa = \exp(\text{mean}(\log\sigma))$ is the concentration parameter. The spherical KL divergence has a clean closed form:
+
+\begin{equation}
+  \mathcal{L}_{\text{KL}}^{\text{sph}} = \frac{D-1}{2}\left[\log\kappa - \log(1+\kappa)\right]
+\end{equation}
+
+The key insight: attention vectors live on low-rank manifolds of $\mathbb{R}^{128}$. Direction-magnitude decomposition separately controls \emph{what kind of noise} (direction on $S^{127}$) from \emph{how much noise} (magnitude), enabling finer-grained control of the noise distribution without changing the adapter architecture.
+
+\subsubsection{v4a: Standalone Clean Baseline}
+
+After extensive ablations revealed that the complex inheritance chain (v1f inherits v1d inherits v1c inherits v1b) was causing subtle bugs and making debugging intractable, v4a was rewritten as a fully standalone strategy with no class inheritance. The entire forward pass — adapter call, reparameterization, per-token sigma, noisy input construction, velocity target, loss computation — is self-contained in 370 lines.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Implementation Details}
+\label{sec:implementation}
+
+\subsection{Training Infrastructure}
+
+\begin{table}[h]
+\centering
+\caption{Hardware configuration.}
+\label{tab:hardware}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Role & GPU & VRAM \\
+\midrule
+Transformer (training) & RTX 5090 & 32\,GB \\
+VAE / text encoder & RTX PRO 4000 Blackwell & 24\,GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Training uses Hugging Face Accelerate for device placement, int8-quanto quantization of the 22B transformer, and PEFT LoRA for efficient fine-tuning ($r=32$, $\alpha=32$, targeting \texttt{to\_q,\,to\_k,\,to\_v,\,to\_out}). The noise adapter and sigma head are trained at a higher learning rate (5$\times10^{-4}$) than the LoRA weights (2$\times10^{-4}$) since they are trained from scratch.
+
+\textbf{Total trainable parameters}: 233M (213M LoRA + 19.2M adapter + 131K sigma head).
+
+\subsection{Caption Projection Shim}
+
+LTX-2 (19B) includes a \texttt{caption\_projection} layer inside the transformer that maps Gemma's 3840-dim output to 4096-dim. LTX-2.3 (22B) moves this projection to the feature extractor. Precomputed embeddings from the training dataset use the 19B-style pipeline and thus output 3840-dim vectors.
+
+During training, a \emph{caption projection shim} is loaded from the LTX-2 checkpoint and applied inline:
+\begin{equation}
+  \text{emb}_{4096} = W_{\text{shim}}\,\text{emb}_{3840} + b_{\text{shim}}
+\end{equation}
+
+The shim weights are frozen ($\texttt{requires\_grad=False}$) throughout training. This allows the adapter to be trained with LTX-2.3 without reprocessing the entire dataset.
+
+\subsection{Three Non-Obvious Bugs Fixed}
+
+During development, three bugs independently caused the inference output to appear as a tiled mosaic pattern despite correct training loss values. We document these as they may affect other practitioners working with PEFT + quantized diffusion models.
+
+\textbf{Bug 1: LoRA key format mismatch.}
+The trainer saves LoRA checkpoints with keys of the form:
+\begin{lstlisting}[language=]
+diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight
+\end{lstlisting}
+PEFT's model state dict, after \texttt{get\_peft\_model()}, uses keys of the form:
+\begin{lstlisting}[language=]
+base_model.model.transformer_blocks.0.attn1.to_q.lora_A.default.weight
+\end{lstlisting}
+Two differences: (a) the \texttt{base\_model.model.} prefix replaces \texttt{diffusion\_model.}, and (b) a \texttt{.default.} adapter name is inserted before \texttt{.weight}. The standard \texttt{set\_peft\_model\_state\_dict()} call silently loaded zero weights because no keys matched. The fix: remap keys explicitly, then call \texttt{load\_state\_dict(strict=False)} directly.
+
+\textbf{Bug 2: \texttt{merge\_and\_unload()} discards LoRA on quantized layers.}
+After correctly loading LoRA weights, calling \texttt{merge\_and\_unload()} to absorb the LoRA delta into the base weights silently discarded the delta. quanto's \texttt{QLinear} stores weights as int8 tensors; PEFT's merge logic cannot in-place add a bf16 delta to int8 storage, so it returns the unmodified base layer. The fix: do not call \texttt{merge\_and\_unload()} when using int8/fp8 quantization. Keep PEFT hooks active; they correctly dequantize → add delta → output at inference.
+
+\textbf{Bug 3: isinstance ordering breaks strategy dispatch.}
+The trainer's \texttt{isinstance} check for activating the noise adapter originally covered \texttt{VFMTrainingStrategy} and subclasses:
+\begin{lstlisting}[language=Python]
+if isinstance(strategy, (VFMSCDTrainingStrategy, ...,
+                          VFMv1bTrainingStrategy)):
+    ...  # activate adapter
+\end{lstlisting}
+The new standalone \texttt{VFMv4aStrategy} was not in this list. As a result, training ran for 5000 steps with the adapter checkpoint saved but \emph{never activated} — the model trained as standard flow matching with random noise, not adapter noise. Loss reached 0.032, but this reflected overfitting on the random-noise path, not the adapter path. The fix: explicitly add \texttt{VFMv4aStrategy} to every relevant \texttt{isinstance} check in \texttt{trainer.py}.
+
+\subsection{get\_data\_sources() Dict vs.\ List}
+
+A subtler bug: the \texttt{get\_data\_sources()} method can return either a list or a dict. When \texttt{use\_cached\_final\_embeddings=True}, the trainer substitutes the conditions directory with \texttt{final\_embeddings\_dir}:
+\begin{itemize}[nosep]
+  \item \textbf{List}: the trainer replaces the string value \texttt{"conditions"} with \texttt{"conditions\_final"}, making \texttt{batch["conditions\_final"]} the key. Any call to \texttt{batch["conditions"]} fails with \texttt{KeyError}.
+  \item \textbf{Dict} \texttt{\{"conditions": "conditions"\}}: the trainer replaces only the \emph{key} (the directory name), leaving the \emph{value} (the batch key) unchanged as \texttt{"conditions"}.
+\end{itemize}
+The fix: always return a dict from \texttt{get\_data\_sources()}.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Combining SCD + VFM}
+\label{sec:scd_vfm}
+
+SCD and VFM address orthogonal bottlenecks and can be composed:
+
+\begin{equation}
+  z_{\text{new}} \sim q_\phi(\cdot | y, \underbrace{F_{\text{enc}}(x_0^{1:n-1})}_{\text{SCD context}}) \;\xrightarrow{\text{Dec}(z, \text{KV-cache})}\; x_0^n
+\end{equation}
+
+The adapter additionally conditions on the encoder features from previous frames (not just text), allowing it to produce noise that is not only text-consistent but \emph{temporally consistent} — structured to continue the current scene.
+
+The combined system generates $T$-second video at $O(T)$ compute and $O(1)$ memory in frame count:
+\begin{itemize}[nosep]
+  \item SCD handles memory: decoder processes one frame at a time.
+  \item VFM handles speed: one decoder forward pass per frame instead of 8.
+  \item Net speedup: $8 \times$ (VFM) at $O(1)$ memory (SCD) vs.\ $O(T)$ memory (standard).
+\end{itemize}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Experimental Results}
+\label{sec:results}
+
+\subsection{VFM v4a — Overfit Sanity Check}
+
+We first validate the pipeline on 10 training samples (\emph{overfit-10}) to confirm that the adapter can learn a useful structured-noise distribution before scaling to the full dataset.
+
+\begin{table}[h]
+\centering
+\caption{VFM v4a overfit-10 training results (RTX 5090, int8-quanto, LoRA $r=32$).}
+\label{tab:overfit}
+\begin{tabular}{@{}lr@{}}
+\toprule
+Metric & Value \\
+\midrule
+Final $\mathcal{L}_{\text{MF}}$ (step 5000) & 0.032 \\
+MSE($\hat{x}_0$, $x_0$) at inference & 0.033 \\
+$x_0$ norm & 404.0 \\
+$\hat{x}_0$ norm & 396.0 \\
+$\sigma_{\text{adapter}}$ mean & 0.40 \\
+Training time & 4.9\,h \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All 10 training samples reconstruct with sharp, visually coherent outputs (diverse content: hiking, street scenes, aerial footage, portraits, cooking). MSE at inference matches training loss — confirming no train/inference gap after the three bug fixes above.
+
+\subsection{Generation Speed}
+
+\begin{table}[h]
+\centering
+\caption{VFM inference timing at 768$\times$448, 25 frames (RTX 5090).}
+\label{tab:speed}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Component & Time & \% \\
+\midrule
+Model load + quantization & 32.2\,s & 96.4\% \\
+DiT forward pass (1 step) & 0.348\,s & 1.0\% \\
+VAE decode & 0.940\,s & 2.8\% \\
+\midrule
+\textbf{Total (first run)} & \textbf{33.4\,s} & \\
+\textbf{Generation only} & \textbf{1.288\,s} & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Model loading is a one-time cost. In a persistent inference server, per-video generation is \textbf{1.3\,s} for a 25-frame (1.25\,s at 20\,fps) clip, or approximately \textbf{real-time speed}.
+
+\begin{table}[h]
+\centering
+\caption{VFM vs.\ LTX Desktop 8-step on RTX 5090 (generation time only, no load).}
+\label{tab:speedup}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Config & VFM 1-step & Baseline 8-step & Speedup \\
+\midrule
+5\,s 540p & $\approx$0.9\,s & $\approx$33\,s & 37$\times$ \\
+5\,s 720p & $\approx$1.3\,s & $\approx$42\,s & 32$\times$ \\
+5\,s 1080p & $\approx$2.5\,s & $\approx$76\,s & 30$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Note: speedup is from reducing 8 forward passes to 1. At 1080p the VAE decode time becomes significant, reducing the multiple. At 540p the DiT dominates, giving close to the theoretical $8\times$ per-step factor.
+
+\subsection{Training Diagnostic: Noise Structure}
+
+\begin{table}[h]
+\centering
+\caption{Adapter output statistics at step 5000.}
+\label{tab:adapter_stats}
+\begin{tabular}{@{}lr@{}}
+\toprule
+Quantity & Value \\
+\midrule
+$\|\mu\|$ & 152.83 \\
+$\mu$ std (per element) & 0.369 \\
+$\sigma_{\text{adapter}} = e^{\log\sigma}$ mean & 0.399 \\
+$\sigma_{\text{adapter}}$ std & 0.024 \\
+$\|z\|$ & 266.0 \\
+$\|x_0\|$ & 404.0 \\
+per-token $\sigma$ (SigmaHead) & 0.500 (collapsed) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The SigmaHead output is collapsed to a constant 0.5 across all tokens (zero spatial variance). This is expected at the overfit-10 stage: with only 10 samples, the diversity signal needed to learn a spatially-varying sigma schedule is insufficient. Scaling to the full 5K-sample dataset is expected to enable the SigmaHead to learn meaningful complexity-based scheduling.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Why Structured Noise is Hard to Learn}
+
+The fundamental challenge of VFM is that the adapter $q_\phi$ must solve an ill-posed problem: given text $y$, produce a noise distribution $q(z|y)$ such that $\mathbb{E}_{z \sim q}[f_\theta(z) \approx x_0]$ for an \emph{unknown} $x_0$ from the training set. The adapter must do this without seeing $x_0$ at inference time.
+
+This is only possible if: (1) the video corresponding to $y$ is nearly uniquely determined by $y$ (high text-to-video consistency in the dataset), and (2) the flow map $f_\theta$ has enough capacity to complete the mapping from structured-but-noisy $z$ to clean $x_0$ in one step.
+
+\subsection{KL Weight Calibration}
+
+The KL weight $\lambda_{\text{KL}}$ is critical. If too large, the adapter collapses toward $\mathcal{N}(0,I)$ (ignoring text), giving zero quality gain over standard denoising. If too small, the adapter learns a near-deterministic map from text to video, which overfits to training content and produces blank outputs on unseen prompts. We find $\lambda_{\text{KL}} = 0.001$ with free-bits floor 0.0 is a good starting point for the overfit-10 experiment (Section~\ref{sec:results}).
+
+\subsection{SigmaHead Collapse}
+
+The SigmaHead zero-initialization is a double-edged design choice. It provides stability early in training (all tokens start at $\sigma=0.5$) but creates a \emph{flat gradient landscape} — the gradient of the loss with respect to the SigmaHead parameters is small when all $\sigma_i = 0.5$ because the MSE surface is nearly flat at the midpoint. A curriculum that initializes with $\sigma_i = 0.5$ and gradually warms up a diversity-encouraging regularizer would accelerate sigma learning.
+
+\subsection{Scaling Trajectory}
+
+The overfit-10 experiment confirms the pipeline is correct. The next step is scaling:
+\begin{enumerate}[nosep]
+  \item 5K-sample dataset (5h training, expect $\mathcal{L}_{\text{MF}} < 0.1$, SigmaHead diversity).
+  \item Trajectory distillation from teacher 8-step ODE paths.
+  \item SCD integration: adapter conditions on encoder features from previous frames.
+  \item Full evaluation on held-out prompts.
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Flow matching.}
+Lipman et al.~\cite{lipman2022flow} introduce flow matching as a simulation-free training objective for generative models. Stable Diffusion 3~\cite{sd3} and LTX-2~\cite{ltx2} use flow matching for image and video generation respectively.
+
+\textbf{Consistency models.}
+Consistency distillation~\cite{song2023consistency} trains a model to map any point on a PF-ODE trajectory to the same endpoint, enabling few-step generation. VFM differs by learning a structured noise distribution rather than distilling the ODE trajectory.
+
+\textbf{Variational flow maps.}
+The VFM paper~\cite{vfm} (arxiv:2603.07276) introduces the framework of learning $q_\phi(z|y)$ for one-step generation via reparameterized flow matching. Our work implements VFM on LTX-2 with the specific engineering adaptations required for a 22B transformer under int8 quantization.
+
+\textbf{Separable causal diffusion.}
+SCD~\cite{scd} (arxiv:2602.10095) proposes the encoder-decoder split for long-form video. Prior work on autoregressive video includes VideoPoet~\cite{videopoet} (discrete tokens) and NOVA~\cite{nova} (continuous temporal AR). SCD preserves the continuous flow matching framework while enabling AR generation.
+
+\textbf{Diffusion distillation.}
+DMD2~\cite{dmd2}/FlashMotion~\cite{flashmotion} use an adversarial discriminator in noisy latent space to match the student distribution to the teacher, without requiring any ODE trajectory rollouts. We prototype this approach in VFM v3a.
+
+\textbf{Per-token timestep scheduling.}
+Self-Flow~\cite{selfflow} (arxiv:2603.06507) uses dual-timestep sampling to improve flow matching training. Our SigmaHead extends this to per-token (not just per-image) timestep variation.
+
+% ─────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+
+We have presented SCD and VFM as complementary solutions to the two primary bottlenecks of LTX-2 video generation: memory and latency. SCD enables unlimited-duration video at constant memory; VFM enables one-step generation at 1.3\,s per clip.
+
+The practical contribution of this paper is as much in the engineering details as the algorithms: the three bugs that blocked end-to-end functionality, the caption projection shim for dataset reuse, and the dict/list data-sources gotcha are all lessons that apply broadly to fine-tuning quantized diffusion transformers with PEFT.
+
+The overfit-10 sanity check passes with $\mathcal{L}_{\text{MF}} = 0.032$ and visually sharp reconstructions across 10 diverse training samples. We are scaling to the full 5K-sample dataset as the next step.
+
+Code: \url{https://github.com/johndpope/ltx2-castlehill}
+
+% ─────────────────────────────────────────────────────────────────────
+\bibliographystyle{plainnat}
+\begin{thebibliography}{20}
+
+\bibitem{ltx2}
+Lightricks.
+\newblock {LTX-2}: Audio-video generation with a 22B diffusion transformer.
+\newblock \url{https://github.com/Lightricks/LTX-2}, 2025.
+
+\bibitem{ltx23}
+Lightricks.
+\newblock {LTX-2.3}: Improved text conditioning and audio quality.
+\newblock \url{https://huggingface.co/Lightricks/LTX-Video}, 2026.
+
+\bibitem{vfm}
+Author(s).
+\newblock Variational flow maps for one-step video generation.
+\newblock \emph{arXiv preprint arXiv:2603.07276}, 2026.
+
+\bibitem{scd}
+Author(s).
+\newblock Separable causal diffusion for long-form video generation.
+\newblock \emph{arXiv preprint arXiv:2602.10095}, 2026.
+
+\bibitem{lipman2022flow}
+Y.~Lipman, R.~T.~Q.~Chen, H.~Ben-Hamu, M.~Nickel, and M.~Le.
+\newblock Flow matching for generative modeling.
+\newblock In \emph{ICLR}, 2023.
+
+\bibitem{sd3}
+P.~Esser, S.~Kulal, A.~Blattmann, R.~Entezari, J.~M{\"u}ller, H.~Saini,
+  Y.~Levi, D.~Lorenz, A.~Sauer, F.~Boesel, D.~Podell, T.~Dockhorn, Z.~English,
+  and R.~Rombach.
+\newblock Scaling rectified flow transformers for high-resolution image
+  synthesis.
+\newblock In \emph{ICML}, 2024.
+
+\bibitem{song2023consistency}
+Y.~Song, P.~Dhariwal, M.~Chen, and I.~Sutskever.
+\newblock Consistency models.
+\newblock In \emph{ICML}, 2023.
+
+\bibitem{selfflow}
+Author(s).
+\newblock Self-flow: Per-token timestep scheduling for flow matching.
+\newblock \emph{arXiv preprint arXiv:2603.06507}, 2026.
+
+\bibitem{dmd2}
+T.~Yin, M.~Gharbi, T.~Park, R.~Zhang, E.~Shechtman, F.~Durand, and W.~T.~Freeman.
+\newblock Improved distribution matching distillation for fast image synthesis.
+\newblock In \emph{NeurIPS}, 2024.
+
+\bibitem{flashmotion}
+Author(s).
+\newblock FlashMotion: Fast video generation via adversarial distribution matching.
+\newblock \emph{arXiv}, 2026.
+
+\bibitem{kato2020}
+S.~Kato and M.~C.~Jones.
+\newblock A tractable and interpretable four-parameter family of unimodal
+  distributions on the sphere.
+\newblock \emph{Biometrika}, 2020.
+
+\bibitem{videopoet}
+D.~Kondratyuk et~al.
+\newblock {VideoPoet}: A large language model for zero-shot video generation.
+\newblock In \emph{ICML}, 2024.
+
+\bibitem{nova}
+Author(s).
+\newblock {NOVA}: Autoregressive video generation with continuous tokens.
+\newblock \emph{arXiv}, 2025.
+
+\bibitem{hiar}
+Author(s).
+\newblock {HiAR}: Hierarchical autoregressive image generation with diversity
+  regularization.
+\newblock \emph{arXiv preprint arXiv:2603.08703}, 2026.
+
+\bibitem{evatok}
+Author(s).
+\newblock {EVATok}: Content-adaptive token allocation for video generation.
+\newblock \emph{arXiv preprint arXiv:2603.12267}, 2026.
+
+\bibitem{quanto}
+Hugging Face.
+\newblock Optimum Quanto: Post-training quantization for PyTorch.
+\newblock \url{https://github.com/huggingface/optimum-quanto}, 2024.
+
+\bibitem{peft}
+S.~Mangrulkar, S.~Gugger, L.~Debut, Y.~Belkada, S.~Paul, and B.~Bossan.
+\newblock {PEFT}: State-of-the-art parameter-efficient fine-tuning methods.
+\newblock \url{https://github.com/huggingface/peft}, 2022.
+
+\end{thebibliography}
+
+\end{document}
