@@ -809,41 +809,59 @@ class LtxvTrainer:
             logger.info(f"Moving {model_size} transformer to {hw_devices.transformer}...")
             self._transformer = self._transformer.to(hw_devices.transformer)
 
-        # LTX-2.3: no caption_projection in transformer, but cached embeddings are 3840-dim
+        # LTX-2.3: no caption_projection in transformer, but cached embeddings may be 3840-dim
         # from LTX-2's feature extractor. Load the caption_projection from the LTX-2 checkpoint
         # to transform 3840→4096 before feeding to the 2.3 transformer.
+        # If embeddings are already 4096-dim (precomputed with LTX-2.3), skip the shim.
         self._caption_projection_shim = None
+        self._needs_connector_for_cached = False
         if self._use_cached_final_embeddings and not (
             hasattr(self._transformer, 'caption_projection') and self._transformer.caption_projection is not None
         ):
-            logger.info("LTX-2.3 detected: cached embeddings are 3840-dim, loading caption_projection shim")
-            # Load caption_projection from LTX-2 checkpoint (lightweight, only a few MB)
-            from safetensors import safe_open  # noqa: PLC0415
-            from ltx_core.model.transformer.text_projection import PixArtAlphaTextProjection  # noqa: PLC0415
-            caption_proj = PixArtAlphaTextProjection(in_features=3840, hidden_size=4096)
-            # Try loading from LTX-2 checkpoint first, fall back to current model
-            ltx2_path = "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
-            import os
-            if os.path.exists(ltx2_path):
-                source_path = ltx2_path
-            else:
-                source_path = str(self._config.model.model_path)
-            with safe_open(source_path, framework="pt") as f:
-                prefix = "model.diffusion_model.caption_projection."
-                for key in f.keys():
-                    if key.startswith(prefix):
-                        param_name = key[len(prefix):]
-                        param = f.get_tensor(key)
-                        parts = param_name.split(".")
-                        obj = caption_proj
-                        for part in parts[:-1]:
-                            obj = getattr(obj, part)
-                        setattr(obj, parts[-1], torch.nn.Parameter(param))
-            self._caption_projection_shim = caption_proj.to(hw_devices.transformer).eval()
-            for p in self._caption_projection_shim.parameters():
-                p.requires_grad = False
-            self._needs_connector_for_cached = True
-            logger.info("Caption projection shim loaded (3840→4096)")
+            # Check actual embedding dimension from the first file
+            emb_dir = Path(self._config.data.preprocessed_data_root) / self._config.data.final_embeddings_dir
+            _skip_shim = False
+            try:
+                _first_file = sorted(emb_dir.glob("*.pt"))[0]
+                _sample = torch.load(_first_file, map_location="cpu", weights_only=False)
+                _emb_dim = _sample.get("video_prompt_embeds", _sample.get("prompt_embeds")).shape[-1]
+                if _emb_dim == 4096:
+                    logger.info(f"Embeddings already 4096-dim ({_first_file.name}), skipping caption_projection shim")
+                    _skip_shim = True
+                else:
+                    logger.info(f"Embeddings are {_emb_dim}-dim, will apply caption_projection shim (3840→4096)")
+            except Exception as e:
+                logger.warning(f"Could not check embedding dim: {e}, will apply shim")
+
+            if not _skip_shim:
+                logger.info("LTX-2.3 detected: cached embeddings are 3840-dim, loading caption_projection shim")
+                # Load caption_projection from LTX-2 checkpoint (lightweight, only a few MB)
+                from safetensors import safe_open  # noqa: PLC0415
+                from ltx_core.model.transformer.text_projection import PixArtAlphaTextProjection  # noqa: PLC0415
+                caption_proj = PixArtAlphaTextProjection(in_features=3840, hidden_size=4096)
+                # Try loading from LTX-2 checkpoint first, fall back to current model
+                ltx2_path = "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+                import os
+                if os.path.exists(ltx2_path):
+                    source_path = ltx2_path
+                else:
+                    source_path = str(self._config.model.model_path)
+                with safe_open(source_path, framework="pt") as f:
+                    prefix = "model.diffusion_model.caption_projection."
+                    for key in f.keys():
+                        if key.startswith(prefix):
+                            param_name = key[len(prefix):]
+                            param = f.get_tensor(key)
+                            parts = param_name.split(".")
+                            obj = caption_proj
+                            for part in parts[:-1]:
+                                obj = getattr(obj, part)
+                            setattr(obj, parts[-1], torch.nn.Parameter(param))
+                self._caption_projection_shim = caption_proj.to(hw_devices.transformer).eval()
+                for p in self._caption_projection_shim.parameters():
+                    p.requires_grad = False
+                self._needs_connector_for_cached = True
+                logger.info("Caption projection shim loaded (3840→4096)")
 
         # Wrap transformer with SCD model if using SCD or VFM-SCD strategy
         from ltx_trainer.training_strategies.scd_strategy import SCDTrainingStrategy  # noqa: PLC0415
@@ -873,10 +891,10 @@ class LtxvTrainer:
         self._noise_adapter = None
         from ltx_trainer.training_strategies.vfm_strategy import VFMTrainingStrategy  # noqa: PLC0415
         from ltx_trainer.training_strategies.vfm_strategy_v1b import VFMv1bTrainingStrategy  # noqa: PLC0415
-        if isinstance(self._training_strategy, (VFMSCDTrainingStrategy, VFMSCDDistillStrategy, VFMTrainingStrategy, VFMv1bTrainingStrategy)):
-            # Set text embed dim for vanilla VFM / v1b (they need it before adapter creation)
-            if isinstance(self._training_strategy, (VFMTrainingStrategy, VFMv1bTrainingStrategy)):
-                # LTX-2 has caption_projection on transformer; LTX-2.3 moved it to feature extractor
+        from ltx_trainer.training_strategies.vfm_v4a_standalone import VFMv4aStrategy  # noqa: PLC0415
+        if isinstance(self._training_strategy, (VFMSCDTrainingStrategy, VFMSCDDistillStrategy, VFMTrainingStrategy, VFMv1bTrainingStrategy, VFMv4aStrategy)):
+            # Set text embed dim (needed before adapter creation for all VFM families)
+            if hasattr(self._training_strategy, "set_text_embed_dim"):
                 if hasattr(self._transformer, 'caption_projection') and self._transformer.caption_projection is not None:
                     text_embed_dim = self._transformer.caption_projection.linear_1.in_features
                 else:
@@ -885,8 +903,8 @@ class LtxvTrainer:
 
             adapter_kwargs = self._training_strategy.get_noise_adapter_params()
 
-            # Use appropriate factory for v1b vs v1a
-            if isinstance(self._training_strategy, VFMv1bTrainingStrategy):
+            # Use appropriate factory: v1b (transformer) vs mlp
+            if isinstance(self._training_strategy, (VFMv1bTrainingStrategy, VFMv4aStrategy)):
                 from ltx_core.model.transformer.noise_adapter_v1b import create_noise_adapter_v1b  # noqa: PLC0415
                 self._noise_adapter = create_noise_adapter_v1b(**adapter_kwargs)
             else:

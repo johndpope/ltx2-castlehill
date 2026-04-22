@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
                         "Requires separate GPUs (--device != --vae-device).")
 
     # Noise adapter config (must match training)
-    parser.add_argument("--adapter-hidden-dim", type=int, default=1024)
+    parser.add_argument("--adapter-hidden-dim", type=int, default=512)
     parser.add_argument("--adapter-num-layers", type=int, default=4)
     parser.add_argument("--adapter-variant", type=str, default="mlp",
                         choices=["mlp", "transformer", "v1b"])
@@ -245,8 +245,35 @@ def main():
         lora_dropout=0.0,
     )
     transformer = get_peft_model(transformer, lora_config)
-    set_peft_model_state_dict(transformer, lora_state)
-    transformer = transformer.merge_and_unload()
+
+    # Remap checkpoint keys to PEFT's expected format.
+    # Trainer saves:  diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight
+    # PEFT expects:   base_model.model.transformer_blocks.0.attn1.to_q.lora_A.default.weight
+    peft_sd = transformer.state_dict()
+    remapped = {}
+    for ck, cv in lora_state.items():
+        # Strip diffusion_model. prefix
+        stripped = ck.removeprefix("diffusion_model.")
+        # Insert .default before .weight for lora_A/lora_B
+        for lora_type in ("lora_A", "lora_B"):
+            if f".{lora_type}.weight" in stripped:
+                stripped = stripped.replace(f".{lora_type}.weight", f".{lora_type}.default.weight")
+                break
+        # Add base_model.model. prefix
+        peft_key = f"base_model.model.{stripped}"
+        if peft_key in peft_sd:
+            remapped[peft_key] = cv
+    matched = len(remapped)
+    print(f"  LoRA key remapping: {matched}/{len(lora_state)} keys matched")
+    if matched == 0:
+        raise RuntimeError("LoRA key remapping failed — 0 keys matched. Check key format.")
+    # Use load_state_dict directly — set_peft_model_state_dict silently drops remapped keys
+    result = transformer.load_state_dict(remapped, strict=False)
+    if result.unexpected_keys:
+        print(f"  WARNING: {len(result.unexpected_keys)} unexpected LoRA keys")
+    # Do NOT call merge_and_unload() — quanto QLinear layers can't absorb bf16 LoRA deltas
+    # in-place. merge_and_unload() silently discards the LoRA on quantized layers.
+    # Keep PEFT hooks active; they correctly dequant → add delta → output.
     transformer.eval()
 
     mem_gb = torch.cuda.memory_allocated(device) / 1e9
@@ -305,7 +332,7 @@ def main():
 
     if sigma_head_path and os.path.exists(sigma_head_path):
         print(f"\n[3b/5] Loading SigmaHead from {sigma_head_path}...")
-        from ltx_trainer.training_strategies.vfm_strategy_v1d import SigmaHead  # noqa: PLC0415
+        from ltx_trainer.training_strategies.vfm_v4a_standalone import SigmaHead  # noqa: PLC0415
         sigma_head = SigmaHead(
             latent_dim=latent_channels,
             hidden_dim=args.sigma_head_hidden_dim,
@@ -382,29 +409,34 @@ def main():
             eps = torch.randn(mu.shape, device=device, dtype=torch.float32, generator=gen)
             z = (mu + sigma_adapter * eps * args.temperature).to(dtype)
 
+            # Bootstrap sigma: fixed mid-range value from SigmaHead's training range [0.05, 0.95].
+            # sigma_adapter = exp(adapter_log_sigma) is the noise sampling scale — a different
+            # quantity from the per-token sigma SigmaHead outputs. Using adapter sigma as
+            # timesteps causes AdaLN mismatch. Fixed 0.5 keeps us in-distribution.
+            bootstrap_sigma = torch.tensor([0.5], device=device, dtype=dtype)          # [1]
+            bootstrap_timesteps = torch.full((1, total_tokens), 0.5, device=device, dtype=dtype)  # [1, seq]
+
             # Flow map evaluation
             if args.num_steps == 1:
-                sigma_val = torch.ones(1, device=device, dtype=dtype)
-
                 if args.two_pass and sigma_head is not None:
                     # ── TWO-PASS INFERENCE ──
-                    # Pass 1: uniform σ=1.0 → rough x̂₀
-                    timesteps_uniform = torch.ones(1, total_tokens, device=device, dtype=dtype)
+                    # Pass 1: bootstrap σ (in training range) → rough x̂₀
                     video_mod_p1 = Modality(
-                        enabled=True, latent=z, sigma=sigma_val,
-                        timesteps=timesteps_uniform, positions=positions,
+                        enabled=True, latent=z, sigma=bootstrap_sigma,
+                        timesteps=bootstrap_timesteps, positions=positions,
                         context=prompt_embeds, context_mask=prompt_mask,
                     )
                     v_pred_p1, _ = transformer(video=video_mod_p1, audio=None, perturbations=None)
                     rough_x0 = z - v_pred_p1
 
-                    # SigmaHead: (adapter_mu, rough x̂₀) → per-token σ
+                    # SigmaHead: (adapter_mu, rough x̂₀) → per-token σ  [1, seq]
                     with torch.no_grad():
-                        per_token_sigma = sigma_head(mu.to(dtype), rough_x0.float()).to(dtype)  # [1, seq]
+                        per_token_sigma = sigma_head(mu.to(dtype), rough_x0.float()).to(dtype)
 
-                    # Pass 2: per-token σ from SigmaHead → sharp x̂₀
+                    # Pass 2: per-token σ + corrected batch sigma
+                    sigma_val_p2 = per_token_sigma.mean(dim=1)  # [B]
                     video_mod_p2 = Modality(
-                        enabled=True, latent=z, sigma=sigma_val,
+                        enabled=True, latent=z, sigma=sigma_val_p2,
                         timesteps=per_token_sigma, positions=positions,
                         context=prompt_embeds, context_mask=prompt_mask,
                     )
@@ -412,10 +444,9 @@ def main():
                     x_out = z - v_pred_p2
                 else:
                     # ── SINGLE-PASS INFERENCE ──
-                    timesteps = torch.ones(1, total_tokens, device=device, dtype=dtype)
                     video_mod = Modality(
-                        enabled=True, latent=z, sigma=sigma_val,
-                        timesteps=timesteps, positions=positions,
+                        enabled=True, latent=z, sigma=bootstrap_sigma,
+                        timesteps=bootstrap_timesteps, positions=positions,
                         context=prompt_embeds, context_mask=prompt_mask,
                     )
                     v_pred, _ = transformer(video=video_mod, audio=None, perturbations=None)
