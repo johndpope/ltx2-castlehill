@@ -1,0 +1,101 @@
+# VFM v4a + Audio — Scrya overfit
+# Structured video noise (adapter) + random audio noise at same sigma.
+# first_frame_conditioning_p=1.0 → always i2v (face drives video).
+# Cross-modal DiT attention synchronises audio to adapter-structured video.
+
+model:
+  model_path: "/media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+
+training_strategy:
+  name: "vfm_v4a"
+
+  # Adapter
+  adapter_variant: "v1b"
+  adapter_hidden_dim: 512
+  adapter_num_heads: 8
+  adapter_num_layers: 4
+  adapter_pos_dim: 256
+
+  # Per-token sigma
+  per_token_sigma: true
+  sigma_head_hidden_dim: 256
+  sigma_min: 0.05
+  sigma_max: 0.95
+
+  # Loss
+  kl_weight: 0.0
+  kl_free_bits: 0.0
+
+  # Audio
+  with_audio: true
+  audio_latents_dir: "audio_latents"
+
+  # Schedule
+  alpha: 1.0
+  first_frame_conditioning_p: 1.0   # always i2v for talking heads
+
+optimization:
+  learning_rate: 2.0e-4
+  adapter_learning_rate: 5.0e-4
+  steps: 3000
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 50
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+hardware:
+  devices:
+    transformer: "cuda:0"
+    vae_decoder: "cuda:1"
+    vae_encoder: "cuda:1"
+
+data:
+  preprocessed_data_root: "/media/12TB/scrya_realistic_photo"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+checkpoints:
+  interval: 500
+  keep_last_n: 3
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "vfm-v4a"
+  entity: null
+  tags: ["vfm-v4a", "audio", "i2v", "scrya", "overfit"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/vfm_v4a_scrya_av"

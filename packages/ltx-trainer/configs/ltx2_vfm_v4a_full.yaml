@@ -1,0 +1,96 @@
+# VFM v4a Standalone — full dataset, 15K steps
+# Validated architecture: overfit-10 reached loss_mf=0.032, clean reconstructions.
+# Scaling to full ddit_ditto_data_23 (~5K samples × 2 latents = ~10K items).
+
+model:
+  model_path: "/media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+
+training_strategy:
+  name: "vfm_v4a"
+
+  # Adapter (NoiseAdapterV1b)
+  adapter_variant: "v1b"
+  adapter_hidden_dim: 512
+  adapter_num_heads: 8
+  adapter_num_layers: 4
+  adapter_pos_dim: 256
+
+  # Per-token sigma
+  per_token_sigma: true
+  sigma_head_hidden_dim: 256
+  sigma_min: 0.05
+  sigma_max: 0.95
+
+  # Loss — light KL to prevent posterior collapse
+  kl_weight: 0.001
+  kl_free_bits: 0.25
+
+  # Training schedule
+  alpha: 1.0
+  first_frame_conditioning_p: 0.1
+
+optimization:
+  learning_rate: 2.0e-4
+  adapter_learning_rate: 5.0e-4
+  steps: 15000
+  batch_size: 2
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 200
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+hardware:
+  devices:
+    transformer: "cuda:0"
+    vae_decoder: "cuda:1"
+    vae_encoder: "cuda:1"
+
+data:
+  preprocessed_data_root: "/media/12TB/ddit_ditto_data_23"
+  num_dataloader_workers: 4
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+checkpoints:
+  interval: 1000
+  keep_last_n: 5
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "vfm-v4a"
+  entity: null
+  tags: ["vfm-v4a", "standalone", "gaussian", "full-dataset", "15k"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/vfm_v4a_full"

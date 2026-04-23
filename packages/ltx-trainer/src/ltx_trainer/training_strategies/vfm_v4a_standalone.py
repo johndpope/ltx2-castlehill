@@ -93,6 +93,10 @@ class VFMv4aConfig(TrainingStrategyConfigBase):
     alpha: float = Field(default=1.0, description="Fraction of steps using adapter noise")
     first_frame_conditioning_p: float = Field(default=0.1)
 
+    # Audio
+    with_audio: bool = Field(default=False)
+    audio_latents_dir: str = Field(default="audio_latents")
+
 
 # ──────────────────────────────────────────────────────────────────
 # Strategy
@@ -160,10 +164,13 @@ class VFMv4aStrategy(TrainingStrategy):
 
     @property
     def requires_audio(self) -> bool:
-        return False
+        return self.config.with_audio
 
     def get_data_sources(self) -> dict[str, str]:
-        return {"latents": "latents", "conditions": "conditions"}
+        sources = {"latents": "latents", "conditions": "conditions"}
+        if self.config.with_audio:
+            sources[self.config.audio_latents_dir] = "audio_latents"
+        return sources
 
     # ── Helpers ─────────────────────────────────────────────────
 
@@ -192,6 +199,50 @@ class VFMv4aStrategy(TrainingStrategy):
         positions[:, 0, ...] = positions[:, 0, ...] / fps
         return positions
 
+    # ── Audio helper ─────────────────────────────────────────────
+
+    def _prepare_audio_inputs(
+        self,
+        batch: dict[str, Any],
+        batch_sigma: Tensor,
+        audio_embeds: Tensor,
+        text_mask: Tensor,
+        B: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[Any, Tensor, Tensor]:
+        """Standard flow-matching audio at same sigma as VFM video batch_sigma."""
+        from ltx_core.model.transformer.modality import Modality
+
+        audio_data = batch["audio_latents"]
+        a0 = self._audio_patchifier.patchify(audio_data["latents"])  # [B, T, C*F]
+        audio_seq_len = a0.shape[1]
+
+        eps = torch.randn_like(a0)
+        sigma_exp = batch_sigma.view(-1, 1, 1)
+        noisy_audio = (1 - sigma_exp) * a0 + sigma_exp * eps
+        audio_targets = eps - a0
+
+        audio_timesteps = batch_sigma.view(-1, 1).expand(-1, audio_seq_len)
+        audio_positions = self._get_audio_positions(
+            num_time_steps=audio_data["latents"].shape[2],
+            batch_size=B,
+            device=device,
+            dtype=dtype,
+        )
+
+        audio_mod = Modality(
+            enabled=True,
+            latent=noisy_audio.to(dtype),
+            sigma=batch_sigma,
+            timesteps=audio_timesteps,
+            positions=audio_positions,
+            context=audio_embeds,
+            context_mask=text_mask,
+        )
+        audio_loss_mask = torch.ones(B, audio_seq_len, dtype=torch.bool, device=device)
+        return audio_mod, audio_targets, audio_loss_mask
+
     # ── Core training step ───────────────────────────────────────
 
     def prepare_training_inputs(
@@ -210,8 +261,11 @@ class VFMv4aStrategy(TrainingStrategy):
         fps = fps[0].item() if fps is not None else DEFAULT_FPS
 
         conditions = batch["conditions"]
-        text_embeds: Tensor = conditions["video_prompt_embeds"]   # [B, text_seq, D]
-        text_mask: Tensor = conditions["prompt_attention_mask"]   # [B, text_seq]
+        text_embeds: Tensor = conditions["video_prompt_embeds"]    # [B, text_seq, D]
+        audio_embeds: Tensor = conditions.get(
+            "audio_prompt_embeds", text_embeds
+        )                                                          # [B, text_seq, D]
+        text_mask: Tensor = conditions["prompt_attention_mask"]    # [B, text_seq]
 
         device = x0_raw.device
         dtype = x0_raw.dtype
@@ -300,13 +354,28 @@ class VFMv4aStrategy(TrainingStrategy):
             context_mask=text_mask,
         )
 
+        # ── Audio modality (random Gaussian noise, same batch_sigma) ────
+        audio_mod = None
+        audio_targets_out = None
+        audio_loss_mask_out = None
+        if cfg.with_audio:
+            audio_mod, audio_targets_out, audio_loss_mask_out = self._prepare_audio_inputs(
+                batch=batch,
+                batch_sigma=batch_sigma,
+                audio_embeds=audio_embeds,
+                text_mask=text_mask,
+                B=B,
+                device=device,
+                dtype=dtype,
+            )
+
         inputs = ModelInputs(
             video=video_mod,
-            audio=None,
+            audio=audio_mod,
             video_targets=video_targets,
-            audio_targets=None,
+            audio_targets=audio_targets_out,
             video_loss_mask=~conditioning_mask,
-            audio_loss_mask=None,
+            audio_loss_mask=audio_loss_mask_out,
         )
 
         # Stash for compute_loss
@@ -335,7 +404,12 @@ class VFMv4aStrategy(TrainingStrategy):
         else:
             loss_mf = video_loss.mean()
 
-        total_loss = loss_mf
+        # Audio loss (standard MSE, all tokens)
+        audio_loss = torch.tensor(0.0, device=video_pred.device)
+        if cfg.with_audio and audio_pred is not None and inputs.audio_targets is not None:
+            audio_loss = (audio_pred - inputs.audio_targets).pow(2).mean()
+
+        total_loss = loss_mf + audio_loss
 
         # Gaussian KL: KL(N(mu, σ²) || N(0,1))
         use_adapter = getattr(inputs, "_vfm_use_adapter", False)
@@ -360,6 +434,7 @@ class VFMv4aStrategy(TrainingStrategy):
                 if wandb.run is not None:
                     wandb.log({
                         "vfm/loss_mf": loss_mf.item(),
+                        "vfm/loss_audio": audio_loss.item(),
                         "vfm/loss_kl": gaussian_kl.item(),
                         "vfm/loss_total": total_loss.item(),
                         "vfm/use_adapter": float(use_adapter),
