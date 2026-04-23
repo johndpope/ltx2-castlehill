@@ -58,6 +58,10 @@ class ModelInputs:
     # Metadata needed for loss computation in some strategies
     ref_seq_len: int | None = None  # For IC-LoRA: length of reference sequence
 
+    # SCD shared noise/sigma for shared-noise training
+    shared_noise: Tensor | None = None
+    shared_sigmas: Tensor | None = None
+
 
 class TrainingStrategy(ABC):
     """Abstract base class for training strategies.

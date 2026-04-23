@@ -15,7 +15,7 @@ from ltx_core.utils import rms_norm
 FFNType = Literal["ffn", "gffn_global", "gffn_hybrid", "gffn_hrr"]
 
 # Type alias for self-attention selection
-SelfAttentionType = Literal["standard", "clifford_rolling"]
+SelfAttentionType = Literal["standard", "clifford_rolling", "smallworld"]
 
 _GFFN_TYPE_TO_VARIANT = {
     "gffn_global": "global",
@@ -89,6 +89,23 @@ def _create_self_attention(
             num_seq_shifts=ck.get("num_seq_shifts", 16),
             num_channel_shifts=ck.get("num_channel_shifts", 4),
             max_seq_len=ck.get("max_seq_len", 2048),
+        )
+    elif self_attn_type == "smallworld":
+        from ltx_core.model.transformer.smallworld_attention import SmallWorldAttention
+
+        ck = clifford_kwargs or {}
+        return SmallWorldAttention(
+            query_dim=query_dim,
+            heads=heads,
+            dim_head=dim_head,
+            context_dim=context_dim,
+            rope_type=rope_type,
+            norm_eps=norm_eps,
+            attention_function=attention_function,
+            apply_gated_attention=apply_gated_attention,
+            num_seq_shifts=ck.get("num_seq_shifts", 32),
+            max_seq_len=ck.get("max_seq_len", 2048),
+            edge_dropout=ck.get("edge_dropout", 0.2),
         )
     else:
         raise ValueError(f"Unknown self_attn_type: {self_attn_type}")
