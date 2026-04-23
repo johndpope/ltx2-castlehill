@@ -97,6 +97,10 @@ class VFMv4aConfig(TrainingStrategyConfigBase):
     with_audio: bool = Field(default=False)
     audio_latents_dir: str = Field(default="audio_latents")
 
+    # W&B reconstruction logging
+    log_reconstructions: bool = Field(default=False)
+    reconstruction_log_interval: int = Field(default=500)
+
 
 # ──────────────────────────────────────────────────────────────────
 # Strategy
@@ -378,12 +382,13 @@ class VFMv4aStrategy(TrainingStrategy):
             audio_loss_mask=audio_loss_mask_out,
         )
 
-        # Stash for compute_loss
+        # Stash for compute_loss and reconstruction logging
         inputs._vfm_use_adapter = use_adapter
         inputs._vfm_mu = mu
         inputs._vfm_log_sigma = log_sigma
         inputs._vfm_z = z
         inputs._vfm_x0 = x0
+        inputs._raw_video_latents = x0_raw  # [B, C, F, H, W] for VAE decode
 
         return inputs
 
@@ -443,3 +448,81 @@ class VFMv4aStrategy(TrainingStrategy):
                 pass
 
         return total_loss
+
+    def log_reconstructions_to_wandb(
+        self,
+        video_pred: Tensor,
+        inputs: ModelInputs,
+        step: int,
+        vae_decoder: torch.nn.Module | None = None,
+    ) -> dict[str, Any]:
+        """Log GT | 1-step reconstruction side-by-side to W&B.
+
+        GT = x0 (ground truth latent decoded through VAE).
+        Pred = x_hat = z - v_pred (VFM 1-step output decoded through VAE).
+        """
+        try:
+            import wandb
+        except ImportError:
+            return {}
+
+        if wandb.run is None or not self.config.log_reconstructions:
+            return {}
+
+        x0_raw = getattr(inputs, "_raw_video_latents", None)  # [B, C, F, H, W]
+        z = getattr(inputs, "_vfm_z", None)                   # [B, seq, 128]
+        if x0_raw is None or z is None:
+            return {}
+
+        import numpy as np
+        import torchvision.utils as vutils
+
+        b, c, f, h, w = x0_raw.shape
+        # x_hat = z - v_pred, then reshape to spatial [B, C, F, H, W]
+        x_hat = (z - video_pred).reshape(b, f, h, w, c).permute(0, 4, 1, 2, 3)
+
+        sample_idx = random.randint(0, b - 1) if b > 1 else 0
+        log_dict: dict[str, Any] = {}
+
+        if vae_decoder is not None:
+            try:
+                dev = next(vae_decoder.parameters()).device
+                dtype = next(vae_decoder.parameters()).dtype
+                with torch.inference_mode():
+                    gt_dec = vae_decoder(x0_raw[sample_idx:sample_idx+1].to(dev, dtype))
+                    pred_dec = vae_decoder(x_hat[sample_idx:sample_idx+1].to(dev, dtype))
+                # [-1,1] → [0,1]
+                gt_frames = (gt_dec[0].float().clamp(-1, 1) * 0.5 + 0.5).cpu()    # [3, T, H, W]
+                pred_frames = (pred_dec[0].float().clamp(-1, 1) * 0.5 + 0.5).cpu()
+
+                # Side-by-side video [T, 3, H, W*2]
+                side = torch.cat([gt_frames, pred_frames], dim=-1)
+                video_np = (side.permute(1, 0, 2, 3) * 255).clamp(0, 255).byte().numpy()
+                log_dict["train/reconstruction_video"] = wandb.Video(
+                    video_np, fps=8,
+                    caption=f"step {step} | left: GT  right: x̂₀=z−v",
+                )
+
+                # Mid-frame image for quick scan
+                mid = gt_frames.shape[1] // 2
+                grid = vutils.make_grid([gt_frames[:, mid], pred_frames[:, mid]], nrow=2, padding=4)
+                log_dict["train/reconstruction"] = wandb.Image(
+                    grid.permute(1, 2, 0).numpy(),
+                    caption=f"step {step} | GT vs x̂₀ (frame {mid})",
+                )
+                return log_dict
+            except Exception as e:
+                logger.warning(f"VAE decode failed for reconstruction log: {e}")
+
+        # Fallback: latent pseudo-RGB (first 3 channels, mid frame)
+        def _norm(t: Tensor) -> Tensor:
+            t = t - t.min(); return t / (t.max() + 1e-8)
+        mid = f // 2
+        gt_vis = _norm(x0_raw[sample_idx, :3, mid].cpu().float())
+        pred_vis = _norm(x_hat[sample_idx, :3, mid].cpu().float())
+        grid = vutils.make_grid([gt_vis, pred_vis], nrow=2, padding=4)
+        log_dict["train/reconstruction_latent"] = wandb.Image(
+            grid.permute(1, 2, 0).numpy(),
+            caption=f"step {step} | GT vs x̂₀ latent (frame {mid})",
+        )
+        return log_dict
