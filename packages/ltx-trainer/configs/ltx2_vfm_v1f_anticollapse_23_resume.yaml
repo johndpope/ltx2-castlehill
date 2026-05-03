@@ -1,0 +1,143 @@
+# =============================================================================
+# VFM v1f — RESUME from anticollapse step 1000
+# =============================================================================
+# Resuming the anti-collapse run from step 1000 checkpoint.
+# Same hyperparameters, just loading from the latest checkpoint.
+# =============================================================================
+
+model:
+  model_path: "/media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+  # Resume from anticollapse step 1000
+  load_checkpoint: "/media/2TB/omnitransfer/output/vfm_v1f_anticollapse_23/checkpoints/lora_weights_step_01000.safetensors"
+  load_noise_adapter: "/media/2TB/omnitransfer/output/vfm_v1f_anticollapse_23/checkpoints/noise_adapter_step_01000.safetensors"
+
+lora:
+  rank: 4
+  alpha: 4
+  dropout: 0.0
+  target_modules:
+    - "to_q"
+    - "to_v"
+
+training_strategy:
+  name: "vfm_v1f"
+
+  # === Spherical Cauchy (v1f) ===
+  spherical_noise: true
+  kappa_min: 1.0
+  kappa_max: 10.0
+  use_slerp_interp: false
+  magnitude_reg_weight: 0.0
+  target_magnitude: 1.0
+  kappa_entropy_weight: 0.0
+  kappa_target: 2.0
+  kappa_pull_weight: 0.0
+
+  # === Per-token sigma (x0-conditioned SigmaHead) ===
+  per_token_sigma: true
+  sigma_min: 0.3
+  sigma_max: 1.0
+  sigma_head_hidden_dim: 256
+  sigma_entropy_weight: 0.0
+  sigma_mean_target: 0.7
+  sigma_mean_pull_weight: 0.0
+
+  # === No distillation ===
+  distill_mode: "none"
+
+  # === v1b Adapter ===
+  adapter_variant: "transformer"
+  adapter_hidden_dim: 512
+  adapter_num_heads: 8
+  adapter_num_layers: 4
+  adapter_pos_dim: 256
+
+  # === VFM Loss — ANTI-COLLAPSE ===
+  tau: 1.0
+  obs_noise_level: 0.2
+  alpha: 1.0
+  kl_weight: 0.0001
+  kl_free_bits: 0.1
+  obs_loss_weight: 25.0
+  adaptive_loss: true
+  ema_decay: 0.999
+  first_frame_conditioning_p: 0.0
+
+  # === Diversity ===
+  diversity_weight: 0.2
+  temporal_diversity_weight: 0.2
+  spatial_diversity_weight: 0.1
+  diversity_warmup_steps: 0
+
+  # === mu→x₀ alignment ===
+  mu_align_weight: 5.0
+  mu_align_warmup_steps: 0
+
+  freeze_dit_steps: 0
+
+  inverse_problem_weights:
+    i2v: 1.0
+
+  with_audio: false
+
+  log_reconstructions: true
+  reconstruction_log_interval: 100
+  log_vfm_metrics: true
+
+optimization:
+  learning_rate: 1.0e-4
+  adapter_learning_rate: 1.0e-3
+  steps: 5000
+  batch_size: 2
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params: {}
+  weight_decay: 0.01
+  warmup_steps: 200
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+hardware:
+  devices:
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+data:
+  preprocessed_data_root: "/media/12TB/ddit_ditto_data_23"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+checkpoints:
+  interval: 500
+  keep_last_n: 10
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "vfm-v1f"
+  entity: null
+  tags: ["vfm-v1f", "anti-collapse", "resume-1000", "ltx-2.3-22b"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/vfm_v1f_anticollapse_23_resume"
