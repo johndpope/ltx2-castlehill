@@ -41,3 +41,4 @@ tmp
 *.webp
 uv.lock
 /wandb
+*.combined

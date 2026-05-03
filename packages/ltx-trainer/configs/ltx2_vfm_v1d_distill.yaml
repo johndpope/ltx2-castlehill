@@ -1,9 +1,10 @@
 # =============================================================================
-# VFM v1d — Trajectory Distillation + Per-Token Timestep Scheduling
+# VFM v1i — Patch Forcing + Trajectory Distillation + Per-Token Uncertainty
 # =============================================================================
-# Trains the VFM noise adapter + sigma head against pre-computed teacher
-# trajectories. The adapter learns structured noise z ~ qφ(z|text), and the
-# sigma head learns per-token noise levels σ_i for heterogeneous denoising.
+# Integrates CompVis Patch Forcing (arxiv:2604.19141) into VFM:
+#   - LTG (Limited Timestep Gap) sampler: global T_max + per-token t ~ U[0,T_max]
+#   - UncertaintyHead: predicts per-token logvar_theta (difficulty-aware)
+#   - NLL loss: flow_loss + uncertainty_weight * NLL(ut | N(vt, σ_θ))
 #
 # Prerequisites:
 #   1. VAE latents: latents_19b/ (pre-encoded video frames)
@@ -12,16 +13,17 @@
 #      ~2453/5000 already computed at /media/12TB/ddit_ditto_data/trajectories/
 #
 # Usage:
-#   # Step 1: Ensure trajectories are computed
-#   uv run python scripts/precompute_trajectories.py \
-#       --data-root /media/12TB/ddit_ditto_data --device cuda:1
+#   uv run python scripts/train.py configs/ltx2_vfm_v1i_patchflow.yaml
 #
-#   # Step 2: Train v1d
-#   uv run python scripts/train.py configs/ltx2_vfm_v1d_distill.yaml
+# Key differences from v1d:
+#   - UncertaintyHead replaces SigmaHead (predicts logvar, not sigma)
+#   - LTG sampling (critical for per-token schedules)
+#   - Explicit NLL uncertainty loss (in addition to diversity/KL)
+#   - RoPE jittering hook ready (set rope_jittering: true if img_meta available)
 # =============================================================================
 
 model:
-  model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+  model_path: "/media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors"
   text_encoder_path: "/media/2TB/ltx-models/gemma"
   training_mode: "lora"
 
@@ -36,16 +38,24 @@ lora:
     - "to_out.0"
 
 training_strategy:
-  name: "vfm_v1d"
+  name: "vfm_v1i_patchflow"
 
-  # === Per-token Sigma Scheduling (Self-Flow inspired) ===
-  per_token_sigma: true
+  # === Patch Forcing Core (NEW) ===
+  use_patch_forcing: true
+  uncertainty_weight: 0.01          # Weight for NLL uncertainty loss
+  ltg_enabled: true                 # Limited Timestep Gap sampler
+  ltg_max_prob: 0.999
+  per_token_uncertainty: true
+  uncertainty_head_hidden_dim: 256
+
+  # === Per-token Sigma Scheduling (from v1d, kept for compatibility) ===
+  per_token_sigma: true             # Still used if distill_mode != "none"
   sigma_head_hidden_dim: 256
   sigma_min: 0.05
   sigma_max: 0.95
   sigma_entropy_weight: 0.01
 
-  # === Trajectory Distillation ===
+  # === Trajectory Distillation (from v1d) ===
   distill_mode: "output_match"
   student_steps: 1
   distill_weight: 1.0
@@ -63,9 +73,9 @@ training_strategy:
   # === VFM Loss (inherited) ===
   tau: 1.0
   obs_noise_level: 0.2
-  alpha: 0.8
+  alpha: 0.8                        # Adapter noise probability (v1d fix)
   kl_weight: 3.0
-  kl_free_bits: 0.05
+  kl_free_bits: 0.05                # Lowered from v1d default (0.25) to allow gradient
   obs_loss_weight: 0.0
   adaptive_loss: false
   ema_decay: 0.999
@@ -85,6 +95,9 @@ training_strategy:
   log_reconstructions: true
   reconstruction_log_interval: 50
   log_vfm_metrics: true
+
+  # === RoPE Jittering (Patch Forcing) ===
+  rope_jittering: false             # Set true if batch contains 'img_meta'
 
 optimization:
   learning_rate: 3.0e-4
@@ -150,10 +163,10 @@ hub:
 
 wandb:
   enabled: true
-  project: "vfm-v1d"
+  project: "vfm-v1i-patchflow"
   entity: null
-  tags: ["vfm-v1d", "distill", "per-token-sigma"]
+  tags: ["vfm-v1i", "patch-forcing", "ltg", "uncertainty-nll", "distill"]
   log_validation_videos: false
 
 seed: 42
-output_dir: "/media/2TB/omnitransfer/output/vfm_v1d_distill"
+output_dir: "/media/2TB/omnitransfer/output/vfm_v1i_patchflow"
