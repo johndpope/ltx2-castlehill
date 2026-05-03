@@ -65,6 +65,16 @@ LTX-2.3 (22B DiT, Lightricks)
     |           W&B: https://wandb.ai/snoozie/vfm-v3b/runs/kyubxb40
     |           W&B: https://wandb.ai/snoozie/vfm-v3b/runs/cgxdj1g6
     |
+    +-- v1i  Patch Forcing (CompVis CVPR 2026, arxiv:2604.19141)
+    |   |    Per-patch heterogeneous timesteps:
+    |   |      LTG sampler (global T_max + per-token t ~ U[0, T_max])
+    |   |      UncertaintyHead → logvar_θ per token
+    |   |      NLL(ut | N(vt, σ_θ)) added to flow loss
+    |   |    Inherits v1d distillation; UncertaintyHead replaces SigmaHead
+    |   |    when use_patch_forcing=true.
+    |   +-- v1i 22B run (uncertainty_weight=0.02, 10K steps)
+    |       W&B: https://wandb.ai/snoozie/vfm-v1i-patchflow
+    |
     +-- NEXT: Consistency Distillation (pivoting from VFM)
         Train LoRA to predict teacher 8-step output in 1 step from Gaussian noise.
         No adapter, no Spherical Cauchy. Simple MSE distillation.
@@ -76,6 +86,10 @@ LTX-2.3 (22B DiT, Lightricks)
         x-- v2a  Speculative noise selection (unimodal, no diversity)
         x-- VFM + Spherical Cauchy + LoRA  (distribution mismatch — LoRA can't
             remap 22B Gaussian-pretrained DiT to Cauchy noise, corrupts base model)
+        x-- X-Cache for SCD AR inference (cross-chunk residual reuse)
+            Diagnostic across 5s/30s/60s: per-step mean cos-sim 0.07–0.27,
+            <7% would-skip rate at any usable threshold. SCD's per-frame fresh
+            noise breaks the cross-chunk-similarity assumption.
 ```
 
 ## Papers Implemented
@@ -90,6 +104,7 @@ LTX-2.3 (22B DiT, Lightricks)
 | [DiagDistill](https://arxiv.org/abs/2603.09488) (ICLR 2026) | Flow Distribution Matching + SpatialHead | v3a flow loss |
 | [OmniForcing](https://arxiv.org/abs/2603.11647) | Audio Sink Tokens, Joint Self-Forcing | Planned (SCD+audio) |
 | [Chain-of-Steps](https://arxiv.org/abs/2603.16870) | Multi-path ensemble at inference | `--ensemble K` flag |
+| [Patch Forcing](https://arxiv.org/abs/2604.19141) (CompVis CVPR 2026) | LTG sampler + per-token uncertainty + NLL loss | **v1i** |
 
 ## Measured Inference Speed (RTX 5090 / Blackwell, int8-quanto)
 
@@ -122,18 +137,25 @@ Drop-in `RotorQuantKVCache` for SCD autoregressive inference. Uses Clifford roto
 ## Quick Start
 
 ```bash
-# Train (consistency distillation — coming soon)
+# Train VFM v1i (Patch Forcing on 22B)
 uv run python packages/ltx-trainer/scripts/train.py \
-    packages/ltx-trainer/configs/ltx2_consistency_distill.yaml
+    packages/ltx-trainer/configs/ltx2_vfm_v1i_patchflow.yaml
 
 # SCD inference (30s+ video, autoregressive)
+# Streaming VAE-decode-and-save is on by default — keeps CPU RAM bounded
+# at one VAE batch's worth of pixels rather than the full pixel buffer
+# (required for >~8min outputs). Pass --no-streaming-save to revert to
+# the legacy buffered path.
 python packages/ltx-trainer/scripts/scd_inference.py \
-    --cached-embedding data/conditions_final/000000.pt \
-    --num-seconds 30 --quantization int8-quanto --output output.mp4
+    --checkpoint /path/to/ltx-2.3-22b-dev.safetensors \
+    --lora-path /path/to/scd_v23/checkpoints/lora_weights_step_02500.safetensors \
+    --prompt "A peaceful mountain lake at sunrise" \
+    --num-seconds 30 --output output.mp4
 ```
 
 ## Roadmap
 
+- **VFM v1i Patch Forcing** (training) - Per-token uncertainty + LTG sampler on 22B
 - **Consistency Distillation** (next) - 1-step generation via teacher distillation (Gaussian noise, no adapter)
 - **RotorQuant bit-packing** - Pack 3-bit indices for full 5.3x compression (currently 1.9x with uint8)
 - **Fused CUDA kernel** - Reduce RotorQuant 36ms/frame overhead for real-time SCD
@@ -150,6 +172,8 @@ Key findings from VFM experiments (v1a through v3b):
 3. **alpha mixing creates train/test mismatch**: Training with alpha=0.5 (50% Gaussian, 50% Cauchy) then inferring with pure Cauchy guarantees garbage output.
 4. **Self-E needs a working base**: Self-evaluating distillation amplifies quality, but can't rescue a fundamentally broken noise distribution.
 5. **RotorQuant works**: 4-bit KV cache compression at 0.993 cosine fidelity is production-ready for SCD streaming.
+6. **SCD generation duration is unbounded by GPU; CPU RAM is the ceiling**: Encoder KV-cache resets per chunk, so VRAM stays flat regardless of length (verified to 600 chunks / 10min). The old failure mode at ~8min was the post-generation pixel buffer (~22GB at 768x448 / 24fps / 10min) thrashing system swap during VAE decode. The streaming `streaming_vae_decode_and_save` path now feeds each VAE batch directly into libx264, capping CPU RAM at one batch.
+7. **X-Cache cross-chunk residual reuse does not apply to SCD's per-frame AR setup**: Diagnostic over 23K (5s) → 46K (60s) comparisons showed mean fingerprint cos-sim *decreasing* with duration (0.24 → 0.07 → 0.01) and flat across denoising steps. Per-frame fresh noise breaks the cross-chunk-similarity assumption x-cache requires.
 
 ## Documentation
 
