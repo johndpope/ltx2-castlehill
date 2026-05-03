@@ -29,6 +29,10 @@ from ltx_trainer.training_strategies.vfm_strategy_v1f import VFMv1fTrainingConfi
 from ltx_trainer.training_strategies.vfm_strategy_v1_2f import VFMv12fTrainingConfig, VFMv12fTrainingStrategy
 from ltx_trainer.training_strategies.vfm_strategy_v1g import VFMv1gTrainingConfig, VFMv1gTrainingStrategy
 from ltx_trainer.training_strategies.vfm_strategy_v1h import VFMv1hTrainingConfig, VFMv1hTrainingStrategy
+from ltx_trainer.training_strategies.vfm_strategy_v1i_patchflow import (
+    VFMv1iPatchFlowConfig,
+    VFMv1iPatchFlowStrategy,
+)
 from ltx_trainer.training_strategies.vfm_strategy_v2a import VFMv2aTrainingConfig, VFMv2aTrainingStrategy
 from ltx_trainer.training_strategies.vfm_strategy_v2b import VFMv2bTrainingConfig, VFMv2bTrainingStrategy
 from ltx_trainer.training_strategies.vfm_strategy_v3a import DMDVFMv3aTrainingConfig, DMDVFMv3aTrainingStrategy
@@ -78,6 +82,8 @@ __all__ = [
     "VFMv1gTrainingStrategy",
     "VFMv1hTrainingConfig",
     "VFMv1hTrainingStrategy",
+    "VFMv1iPatchFlowConfig",
+    "VFMv1iPatchFlowStrategy",
     "VFMv2aTrainingConfig",
     "VFMv2aTrainingStrategy",
     "DMDVFMv3aTrainingConfig",
@@ -128,6 +134,8 @@ def get_training_strategy(config: TrainingStrategyConfig) -> TrainingStrategy:
             strategy = VFMv2bTrainingStrategy(config)
         case VFMv2aTrainingConfig():
             strategy = VFMv2aTrainingStrategy(config)
+        case VFMv1iPatchFlowConfig():
+            strategy = VFMv1iPatchFlowStrategy(config)
         case VFMv1hTrainingConfig():
             strategy = VFMv1hTrainingStrategy(config)
         case VFMv1gTrainingConfig():

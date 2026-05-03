@@ -10,6 +10,7 @@ import av
 import numpy as np
 import torch
 from torch import Tensor
+from tqdm import tqdm
 
 
 def get_video_frame_count(video_path: str | Path) -> int:
@@ -100,6 +101,106 @@ def save_video(
         # Write audio if provided
         if audio is not None:
             _write_audio(container, audio_stream, audio, audio_sample_rate)
+
+
+def streaming_vae_decode_and_save(
+    vae_decoder,
+    all_latent: torch.Tensor,
+    n_latent: int,
+    actual_pixel: int,
+    output_path: Path | str,
+    fps: float,
+    vae_device: str = "cuda:1",
+    decode_batch: int = 8,
+    overlap: int = 1,
+    pixel_per_latent: int = 8,
+    crf: int = 18,
+) -> int:
+    """Decode latents through VAE and stream-encode directly to mp4 without
+    materializing the full pixel tensor in CPU RAM.
+
+    For each overlap-batched VAE call: decode on `vae_device` → range-convert
+    [-1,1] → [0,1] → uint8 on GPU → move to CPU → feed each frame into the
+    libx264 encoder → drop. Peak CPU RAM cost is O(one batch of pixels).
+
+    Args:
+        vae_decoder: callable VAE returning [1, 3, F_pixel, H, W] in [-1, 1].
+        all_latent: latent tensor [1, C, n_latent, H_lat, W_lat] (CPU or any device).
+        n_latent: number of latent frames in `all_latent` along dim=2.
+        actual_pixel: target pixel-frame count; encoding stops when reached.
+        output_path: destination .mp4 (parents created if missing).
+        fps: output framerate.
+        vae_device: device the VAE lives on.
+        decode_batch: latent frames per VAE call.
+        overlap: latent-frame overlap between batches for temporal-VAE continuity.
+        pixel_per_latent: temporal expansion factor (LTX-2 = 8).
+        crf: libx264 CRF (lower = higher quality, larger file).
+
+    Returns:
+        Number of pixel frames written.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    stride = decode_batch - overlap
+
+    # Probe first batch to learn H/W (avoids passing them in)
+    with torch.inference_mode():
+        probe_end = min(decode_batch, n_latent)
+        probe_batch = all_latent[:, :, :probe_end].to(vae_device)
+        probe_pixels = vae_decoder(probe_batch)  # [1, 3, F_pixel, H, W]
+    height, width = probe_pixels.shape[3], probe_pixels.shape[4]
+    # Convert + cast probe on GPU, ship to CPU as uint8
+    probe_pixels = ((probe_pixels + 1.0) / 2.0).clamp(0, 1)
+    probe_pixels = (probe_pixels * 255.0).to(torch.uint8)
+    probe_np = probe_pixels[0].permute(1, 2, 3, 0).cpu().numpy()  # [F, H, W, 3]
+    del probe_batch, probe_pixels
+    torch.cuda.empty_cache()
+
+    total_written = 0
+    with av.open(str(output_path), mode="w") as container:
+        video_stream = container.add_stream("libx264", rate=int(fps))
+        video_stream.width = width
+        video_stream.height = height
+        video_stream.pix_fmt = "yuv420p"
+        video_stream.options = {"crf": str(crf)}
+
+        def _emit(frames_np: np.ndarray) -> None:
+            nonlocal total_written
+            for j in range(frames_np.shape[0]):
+                if total_written >= actual_pixel:
+                    return
+                frame = av.VideoFrame.from_ndarray(frames_np[j], format="rgb24")
+                for packet in video_stream.encode(frame):
+                    container.mux(packet)
+                total_written += 1
+
+        # Emit probe batch (acts as i=0)
+        _emit(probe_np)
+
+        # Continue from stride onward; skip overlap region for non-first batches
+        for i in tqdm(range(stride, n_latent, stride), desc="Streaming VAE decode", unit="batch"):
+            if total_written >= actual_pixel:
+                break
+            end = min(i + decode_batch, n_latent)
+            batch = all_latent[:, :, i:end].to(vae_device)
+            with torch.inference_mode():
+                pixels = vae_decoder(batch)  # [1, 3, F_pixel, H, W]
+            pixels = ((pixels + 1.0) / 2.0).clamp(0, 1)
+            pixels = (pixels * 255.0).to(torch.uint8)
+            # Skip overlap region in pixel space
+            skip = overlap * pixel_per_latent
+            pixels = pixels[:, :, skip:]
+            frames_np = pixels[0].permute(1, 2, 3, 0).cpu().numpy()
+            _emit(frames_np)
+            del batch, pixels, frames_np
+            torch.cuda.empty_cache()
+
+        # Flush encoder
+        for packet in video_stream.encode():
+            container.mux(packet)
+
+    return total_written
 
 
 def _prepare_video_array(video_tensor: torch.Tensor) -> np.ndarray:
