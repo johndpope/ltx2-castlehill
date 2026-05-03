@@ -432,6 +432,16 @@ def main() -> None:
              "Makes decoder compute-bound so DDiT gives full 2-3x speedup.",
     )
 
+    # Streaming VAE-decode-and-save: required for >~8min videos to keep CPU RAM
+    # bounded (~one decode batch worth of pixels rather than the full video).
+    parser.add_argument(
+        "--no-streaming-save",
+        action="store_false",
+        dest="streaming_save",
+        help="Disable streaming VAE-decode-to-encoder pipeline; buffer full "
+             "pixel tensor in CPU RAM (legacy path, OOMs around 8-10min @ 24fps).",
+    )
+
     # Output
     parser.add_argument("--output", type=str, required=True, help="Output video path (.mp4)")
 
@@ -575,28 +585,40 @@ def main() -> None:
         prompt_mask = emb["prompt_attention_mask"].unsqueeze(0)
         print(f"  Shape: {prompt_embeds.shape}")
     else:
-        print(f"\n[1/4] Loading text encoder on cuda:1...")
-        from ltx_trainer.model_loader import load_text_encoder
+        # Split text-encoder load across GPUs:
+        #   text_encoder (~22GB AV-Gemma bf16) -> cuda:0 (32GB 5090)
+        #   embeddings_processor (small connector weights, but loader briefly holds
+        #     the 22B checkpoint scan) -> cuda:1 (24GB)
+        # Both unloaded before the transformer loads on cuda:0.
+        from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
+
+        text_enc_device = "cuda:0"
+        proc_device = "cuda:1"
+        print(f"\n[1/4] Loading text encoder on {text_enc_device}, processor on {proc_device}...")
 
         text_encoder = load_text_encoder(
-            args.checkpoint,
-            args.text_encoder_path,
-            device="cuda:1",
-            dtype=torch.bfloat16,
+            args.text_encoder_path, device=text_enc_device, dtype=torch.bfloat16,
         )
         text_encoder.eval()
+        embeddings_processor = load_embeddings_processor(
+            args.checkpoint, device=proc_device, dtype=torch.bfloat16,
+        )
 
         print(f"  Encoding: '{args.prompt[:80]}'")
         with torch.inference_mode():
-            # text_encoder(str) → AVGemmaEncoderOutput(video_encoding, audio_encoding, attention_mask)
-            video_embeds, _audio_embeds, attention_mask = text_encoder(args.prompt)
-            prompt_embeds = video_embeds.to(torch.bfloat16)  # [1, 1024, 3840]
-            prompt_mask = attention_mask  # [1, 1024]
+            hs, hs_mask = text_encoder.encode(args.prompt)
+            # encode() returns hidden_states as a tuple of per-layer tensors.
+            # Move each layer + mask to the processor's device.
+            hs = tuple(t.to(proc_device) for t in hs)
+            hs_mask = hs_mask.to(proc_device)
+            out = embeddings_processor.process_hidden_states(hs, hs_mask)
+            prompt_embeds = out.video_encoding.to(torch.bfloat16)
+            prompt_mask = out.attention_mask
 
-        print(f"  Shape: {prompt_embeds.shape}")
+        print(f"  Shape: {prompt_embeds.shape}  mask: {prompt_mask.shape}")
 
-        # Free text encoder before loading transformer
-        del text_encoder
+        # Free both before loading transformer (cuda:0 must be clean for fp8 transformer)
+        del text_encoder, embeddings_processor
         gc.collect()
         torch.cuda.empty_cache()
         print("  Text encoder unloaded")
@@ -996,9 +1018,10 @@ def main() -> None:
         modality = Modality(
             enabled=True,
             latent=patchified,
+            sigma=torch.zeros(1, device=enc_device, dtype=dtype),
             timesteps=torch.zeros(1, tokens_per_frame, device=enc_device, dtype=dtype),
             positions=get_positions_for_frame(frame_pos, target_device=enc_device),
-            context=prompt_embeds,  # prompt_embeds is on cuda:0 (enc_device)
+            context=prompt_embeds,
             context_mask=prompt_mask,
         )
         # SCD Paper, Section 4.1: forward_encoder uses causal attention mask internally.
@@ -1091,6 +1114,7 @@ def main() -> None:
         merged_mod = Modality(
             enabled=True,
             latent=dummy_latent,
+            sigma=torch.full((1,), float(sigma), device=dec_device, dtype=dtype),
             timesteps=merged_ts,
             positions=merged_positions,
             context=dec_prompt,
@@ -1461,6 +1485,7 @@ def main() -> None:
                         dec_modality = Modality(
                             enabled=True,
                             latent=noisy_patch,
+                            sigma=sigma.reshape(1).to(device=dec_device, dtype=dtype),
                             timesteps=torch.full((1, dec_seq), sigma.item(), device=dec_device, dtype=dtype),
                             positions=dec_positions,
                             context=dec_prompt,
@@ -1522,6 +1547,7 @@ def main() -> None:
                                 uncond_modality = Modality(
                                     enabled=True,
                                     latent=noisy_patch,
+                                    sigma=sigma.reshape(1).to(device=dec_device, dtype=dtype),
                                     timesteps=torch.full((1, dec_seq), sigma.item(), device=dec_device, dtype=dtype),
                                     positions=dec_positions,
                                     context=null_embeds,
@@ -1674,6 +1700,33 @@ def main() -> None:
     n_latent = all_latent.shape[2]
     expected_pixel = (n_latent - 1) * 8 + 1
     print(f"\n  Decoding {n_latent} latent frames → {expected_pixel} pixel frames with VAE...")
+
+    # Streaming path: decode + encode in lockstep; CPU RAM cap = 1 batch.
+    # Required for prolonged generation (~10min+) where full pixel buffer (~22GB)
+    # would otherwise exhaust system RAM during VAE decode.
+    if getattr(args, "streaming_save", True):
+        from ltx_trainer.video_utils import streaming_vae_decode_and_save
+
+        output_path = Path(args.output)
+        n_written = streaming_vae_decode_and_save(
+            vae_decoder=vae_decoder,
+            all_latent=all_latent,
+            n_latent=n_latent,
+            actual_pixel=actual_pixel,
+            output_path=output_path,
+            fps=args.fps,
+            vae_device="cuda:1",
+        )
+        del all_latent
+        torch.cuda.empty_cache()
+
+        total_elapsed = time.time() - t_start
+        print(f"\n{'=' * 65}")
+        print(f"  Saved: {output_path}")
+        print(f"  Total time: {total_elapsed / 60:.1f} min")
+        print(f"  Video: {n_written} frames, {n_written / args.fps:.1f}s @ {args.fps} fps")
+        print(f"{'=' * 65}")
+        return
 
     # Try full-sequence decode first; fall back to batched if OOM
     try:

@@ -1,0 +1,151 @@
+# =============================================================================
+# VFM v4a — Gaussian Adapter + Self-E (5K dataset)
+# =============================================================================
+# Pivot from Spherical Cauchy (v1f→v3b all failed at inference).
+# The DiT was pretrained on Gaussian noise — a rank-32 LoRA can learn
+# to denoise Gaussian adapter noise without distribution mismatch.
+#
+# Architecture:
+#   Text → NoiseAdapterV1b → mu, log_sigma → z = mu + sigma*eps [Gaussian]
+#   z → DiT 22B (LoRA r=32) → velocity → x̂₀ = z - v
+#   Loss: data_loss + self_eval(50%) + Gaussian KL
+#
+# Key changes from v3b:
+#   - spherical_noise: false (Gaussian reparameterization)
+#   - Standard Gaussian KL instead of Spherical Cauchy KL
+#   - No Cauchy-specific losses (kappa, magnitude, mu_align)
+#   - Everything else identical to v3b (Self-E, adapter, LoRA)
+# =============================================================================
+
+model:
+  model_path: "/media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+  load_checkpoint: null
+  load_noise_adapter: null
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+
+training_strategy:
+  name: "vfm_v4a"
+
+  # === GAUSSIAN NOISE (the whole point of v4a) ===
+  spherical_noise: false
+
+  # === ONLY these losses ===
+  kl_weight: 0.001
+  kl_free_bits: 0.25
+  self_eval_weight: 1.0
+  self_eval_cfg_scale: 5.0
+  self_eval_s_range: [0.2, 0.4]
+  energy_preserving_norm: true
+  self_eval_prob: 0.5
+
+  # === EVERYTHING ELSE OFF ===
+  obs_loss_weight: 0.0
+  obs_noise_level: 0.2
+  latent_perceptual_weight: 0.0
+  mu_align_weight: 0.0
+  mu_align_warmup_steps: 0
+  diversity_weight: 0.0
+  temporal_diversity_weight: 0.0
+  spatial_diversity_weight: 0.0
+  diversity_warmup_steps: 0
+  recon_weight: 0.0
+  flow_match_weight: 0.0
+  gt_weight: 0.0
+
+  # === Alpha 1.0 (ALWAYS adapter noise) ===
+  alpha: 1.0
+
+  # Adapter
+  adapter_variant: "transformer"
+  adapter_hidden_dim: 512
+  adapter_num_heads: 8
+  adapter_num_layers: 4
+  adapter_pos_dim: 256
+
+  # Per-token sigma
+  per_token_sigma: true
+  sigma_min: 0.05
+  sigma_max: 0.95
+  sigma_head_hidden_dim: 256
+
+  # VFM base
+  tau: 1.0
+  adaptive_loss: true
+  ema_decay: 0.999
+  first_frame_conditioning_p: 0.1
+  distill_mode: "none"
+
+  inverse_problem_weights:
+    i2v: 0.4
+    t2v: 0.6
+
+  with_audio: false
+
+  log_reconstructions: true
+  reconstruction_log_interval: 500
+  log_vfm_metrics: true
+
+optimization:
+  learning_rate: 2.0e-4
+  adapter_learning_rate: 5.0e-4
+  steps: 15000
+  batch_size: 2
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 500
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+hardware:
+  devices:
+    transformer: "cuda:0"
+    vae_decoder: "cuda:1"
+    vae_encoder: "cuda:1"
+
+data:
+  preprocessed_data_root: "/media/12TB/ddit_ditto_data_23"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+checkpoints:
+  interval: 1000
+  keep_last_n: 5
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "vfm-v4a"
+  entity: null
+  tags: ["vfm-v4a", "gaussian", "self-e", "5k", "no-spherical"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/vfm_v4a_5k"

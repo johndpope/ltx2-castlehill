@@ -93,6 +93,14 @@ class VFMv4aConfig(TrainingStrategyConfigBase):
     alpha: float = Field(default=1.0, description="Fraction of steps using adapter noise")
     first_frame_conditioning_p: float = Field(default=0.1)
 
+    # Audio
+    with_audio: bool = Field(default=False)
+    audio_latents_dir: str = Field(default="audio_latents")
+
+    # W&B reconstruction logging
+    log_reconstructions: bool = Field(default=False)
+    reconstruction_log_interval: int = Field(default=500)
+
 
 # ──────────────────────────────────────────────────────────────────
 # Strategy
@@ -160,10 +168,13 @@ class VFMv4aStrategy(TrainingStrategy):
 
     @property
     def requires_audio(self) -> bool:
-        return False
+        return self.config.with_audio
 
     def get_data_sources(self) -> dict[str, str]:
-        return {"latents": "latents", "conditions": "conditions"}
+        sources = {"latents": "latents", "conditions": "conditions"}
+        if self.config.with_audio:
+            sources[self.config.audio_latents_dir] = "audio_latents"
+        return sources
 
     # ── Helpers ─────────────────────────────────────────────────
 
@@ -192,6 +203,50 @@ class VFMv4aStrategy(TrainingStrategy):
         positions[:, 0, ...] = positions[:, 0, ...] / fps
         return positions
 
+    # ── Audio helper ─────────────────────────────────────────────
+
+    def _prepare_audio_inputs(
+        self,
+        batch: dict[str, Any],
+        batch_sigma: Tensor,
+        audio_embeds: Tensor,
+        text_mask: Tensor,
+        B: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[Any, Tensor, Tensor]:
+        """Standard flow-matching audio at same sigma as VFM video batch_sigma."""
+        from ltx_core.model.transformer.modality import Modality
+
+        audio_data = batch["audio_latents"]
+        a0 = self._audio_patchifier.patchify(audio_data["latents"])  # [B, T, C*F]
+        audio_seq_len = a0.shape[1]
+
+        eps = torch.randn_like(a0)
+        sigma_exp = batch_sigma.view(-1, 1, 1)
+        noisy_audio = (1 - sigma_exp) * a0 + sigma_exp * eps
+        audio_targets = eps - a0
+
+        audio_timesteps = batch_sigma.view(-1, 1).expand(-1, audio_seq_len)
+        audio_positions = self._get_audio_positions(
+            num_time_steps=audio_data["latents"].shape[2],
+            batch_size=B,
+            device=device,
+            dtype=dtype,
+        )
+
+        audio_mod = Modality(
+            enabled=True,
+            latent=noisy_audio.to(dtype),
+            sigma=batch_sigma,
+            timesteps=audio_timesteps,
+            positions=audio_positions,
+            context=audio_embeds,
+            context_mask=text_mask,
+        )
+        audio_loss_mask = torch.ones(B, audio_seq_len, dtype=torch.bool, device=device)
+        return audio_mod, audio_targets, audio_loss_mask
+
     # ── Core training step ───────────────────────────────────────
 
     def prepare_training_inputs(
@@ -210,8 +265,11 @@ class VFMv4aStrategy(TrainingStrategy):
         fps = fps[0].item() if fps is not None else DEFAULT_FPS
 
         conditions = batch["conditions"]
-        text_embeds: Tensor = conditions["video_prompt_embeds"]   # [B, text_seq, D]
-        text_mask: Tensor = conditions["prompt_attention_mask"]   # [B, text_seq]
+        text_embeds: Tensor = conditions["video_prompt_embeds"]    # [B, text_seq, D]
+        audio_embeds: Tensor = conditions.get(
+            "audio_prompt_embeds", text_embeds
+        )                                                          # [B, text_seq, D]
+        text_mask: Tensor = conditions["prompt_attention_mask"]    # [B, text_seq]
 
         device = x0_raw.device
         dtype = x0_raw.dtype
@@ -300,21 +358,37 @@ class VFMv4aStrategy(TrainingStrategy):
             context_mask=text_mask,
         )
 
+        # ── Audio modality (random Gaussian noise, same batch_sigma) ────
+        audio_mod = None
+        audio_targets_out = None
+        audio_loss_mask_out = None
+        if cfg.with_audio:
+            audio_mod, audio_targets_out, audio_loss_mask_out = self._prepare_audio_inputs(
+                batch=batch,
+                batch_sigma=batch_sigma,
+                audio_embeds=audio_embeds,
+                text_mask=text_mask,
+                B=B,
+                device=device,
+                dtype=dtype,
+            )
+
         inputs = ModelInputs(
             video=video_mod,
-            audio=None,
+            audio=audio_mod,
             video_targets=video_targets,
-            audio_targets=None,
+            audio_targets=audio_targets_out,
             video_loss_mask=~conditioning_mask,
-            audio_loss_mask=None,
+            audio_loss_mask=audio_loss_mask_out,
         )
 
-        # Stash for compute_loss
+        # Stash for compute_loss and reconstruction logging
         inputs._vfm_use_adapter = use_adapter
         inputs._vfm_mu = mu
         inputs._vfm_log_sigma = log_sigma
         inputs._vfm_z = z
         inputs._vfm_x0 = x0
+        inputs._raw_video_latents = x0_raw  # [B, C, F, H, W] for VAE decode
 
         return inputs
 
@@ -335,7 +409,12 @@ class VFMv4aStrategy(TrainingStrategy):
         else:
             loss_mf = video_loss.mean()
 
-        total_loss = loss_mf
+        # Audio loss (standard MSE, all tokens)
+        audio_loss = torch.tensor(0.0, device=video_pred.device)
+        if cfg.with_audio and audio_pred is not None and inputs.audio_targets is not None:
+            audio_loss = (audio_pred - inputs.audio_targets).pow(2).mean()
+
+        total_loss = loss_mf + audio_loss
 
         # Gaussian KL: KL(N(mu, σ²) || N(0,1))
         use_adapter = getattr(inputs, "_vfm_use_adapter", False)
@@ -360,6 +439,7 @@ class VFMv4aStrategy(TrainingStrategy):
                 if wandb.run is not None:
                     wandb.log({
                         "vfm/loss_mf": loss_mf.item(),
+                        "vfm/loss_audio": audio_loss.item(),
                         "vfm/loss_kl": gaussian_kl.item(),
                         "vfm/loss_total": total_loss.item(),
                         "vfm/use_adapter": float(use_adapter),
@@ -368,3 +448,81 @@ class VFMv4aStrategy(TrainingStrategy):
                 pass
 
         return total_loss
+
+    def log_reconstructions_to_wandb(
+        self,
+        video_pred: Tensor,
+        inputs: ModelInputs,
+        step: int,
+        vae_decoder: torch.nn.Module | None = None,
+    ) -> dict[str, Any]:
+        """Log GT | 1-step reconstruction side-by-side to W&B.
+
+        GT = x0 (ground truth latent decoded through VAE).
+        Pred = x_hat = z - v_pred (VFM 1-step output decoded through VAE).
+        """
+        try:
+            import wandb
+        except ImportError:
+            return {}
+
+        if wandb.run is None or not self.config.log_reconstructions:
+            return {}
+
+        x0_raw = getattr(inputs, "_raw_video_latents", None)  # [B, C, F, H, W]
+        z = getattr(inputs, "_vfm_z", None)                   # [B, seq, 128]
+        if x0_raw is None or z is None:
+            return {}
+
+        import numpy as np
+        import torchvision.utils as vutils
+
+        b, c, f, h, w = x0_raw.shape
+        # x_hat = z - v_pred, then reshape to spatial [B, C, F, H, W]
+        x_hat = (z - video_pred).reshape(b, f, h, w, c).permute(0, 4, 1, 2, 3)
+
+        sample_idx = random.randint(0, b - 1) if b > 1 else 0
+        log_dict: dict[str, Any] = {}
+
+        if vae_decoder is not None:
+            try:
+                dev = next(vae_decoder.parameters()).device
+                dtype = next(vae_decoder.parameters()).dtype
+                with torch.inference_mode():
+                    gt_dec = vae_decoder(x0_raw[sample_idx:sample_idx+1].to(dev, dtype))
+                    pred_dec = vae_decoder(x_hat[sample_idx:sample_idx+1].to(dev, dtype))
+                # [-1,1] → [0,1]
+                gt_frames = (gt_dec[0].float().clamp(-1, 1) * 0.5 + 0.5).cpu()    # [3, T, H, W]
+                pred_frames = (pred_dec[0].float().clamp(-1, 1) * 0.5 + 0.5).cpu()
+
+                # Side-by-side video [T, 3, H, W*2]
+                side = torch.cat([gt_frames, pred_frames], dim=-1)
+                video_np = (side.permute(1, 0, 2, 3) * 255).clamp(0, 255).byte().numpy()
+                log_dict["train/reconstruction_video"] = wandb.Video(
+                    video_np, fps=8,
+                    caption=f"step {step} | left: GT  right: x̂₀=z−v",
+                )
+
+                # Mid-frame image for quick scan
+                mid = gt_frames.shape[1] // 2
+                grid = vutils.make_grid([gt_frames[:, mid], pred_frames[:, mid]], nrow=2, padding=4)
+                log_dict["train/reconstruction"] = wandb.Image(
+                    grid.permute(1, 2, 0).numpy(),
+                    caption=f"step {step} | GT vs x̂₀ (frame {mid})",
+                )
+                return log_dict
+            except Exception as e:
+                logger.warning(f"VAE decode failed for reconstruction log: {e}")
+
+        # Fallback: latent pseudo-RGB (first 3 channels, mid frame)
+        def _norm(t: Tensor) -> Tensor:
+            t = t - t.min(); return t / (t.max() + 1e-8)
+        mid = f // 2
+        gt_vis = _norm(x0_raw[sample_idx, :3, mid].cpu().float())
+        pred_vis = _norm(x_hat[sample_idx, :3, mid].cpu().float())
+        grid = vutils.make_grid([gt_vis, pred_vis], nrow=2, padding=4)
+        log_dict["train/reconstruction_latent"] = wandb.Image(
+            grid.permute(1, 2, 0).numpy(),
+            caption=f"step {step} | GT vs x̂₀ latent (frame {mid})",
+        )
+        return log_dict

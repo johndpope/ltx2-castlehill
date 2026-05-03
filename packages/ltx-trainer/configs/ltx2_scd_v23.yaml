@@ -1,0 +1,111 @@
+model:
+  model_path: /media/12TB/ltx-models/ltx23/ltx-2.3-22b-dev.safetensors
+  text_encoder_path: /media/2TB/ltx-models/gemma
+  training_mode: lora
+  load_checkpoint: /media/2TB/omnitransfer/output/scd_v23_enc_noise/checkpoints/lora_weights_step_01000.safetensors
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - to_k
+    - to_q
+    - to_v
+    - to_out.0
+
+training_strategy:
+  name: scd
+  with_audio: false
+  encoder_layers: 32
+  decoder_input_combine: token_concat
+  per_frame_decoder: true
+  decoder_multi_batch: 1
+  first_frame_conditioning_p: 0.5
+  clean_context_ratio: 0.0
+  scheduled_sampling: false
+  ss_noise_augment: 0.05
+  ss_p_ar_start: 0.0
+  ss_p_ar_end: 0.5
+  ss_ramp_steps: 150
+  ss_warmup_steps: 50
+  log_reconstructions: true
+  reconstruction_log_interval: 50
+
+optimization:
+  steps: 1000
+  learning_rate: 0.02
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  optimizer_type: muon
+  scheduler_type: cosine
+  scheduler_params: {}
+  warmup_steps: 0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  enable_gradient_checkpointing: true
+
+flow_matching:
+  timestep_sampling_mode: shifted_logit_normal
+  timestep_sampling_params: {}
+
+acceleration:
+  mixed_precision_mode: bf16
+  quantization: fp8-quanto
+  load_text_encoder_in_8bit: true
+
+data:
+  preprocessed_data_root: /media/2TB/omnitransfer/data/ditto_subset
+  final_embeddings_dir: conditions_final_v23
+  use_cached_final_embeddings: true
+  live_ingest_enabled: false
+  num_dataloader_workers: 2
+
+hardware:
+  devices:
+    transformer: cuda:0
+    vae_encoder: cuda:1
+    vae_decoder: cuda:1
+    text_encoder: cuda:1
+    audio_vae: cuda:0
+    vocoder: cuda:0
+
+checkpoints:
+  interval: 500
+  keep_last_n: 3
+  precision: bfloat16
+
+validation:
+  interval: null
+  skip_initial_validation: true
+  video_dims: [768, 448, 25]
+  frame_rate: 20.0
+  inference_steps: 30
+  guidance_scale: 4.0
+  seed: 42
+  prompts: []
+  negative_prompt: blurry, distorted, low quality
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: stg_v
+  videos_per_prompt: 1
+  generate_audio: false
+  include_reference_in_output: false
+  images: null
+  reference_videos: null
+
+wandb:
+  enabled: true
+  project: scd-v23
+  tags:
+    - scd
+    - ltx-2.3
+    - 22b
+    - muon
+    - token-concat
+    - ditto-1m
+    - enc-noise
+  log_validation_videos: false
+
+output_dir: /media/2TB/omnitransfer/output/scd_v23_enc_noise
+seed: 42

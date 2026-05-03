@@ -1,0 +1,164 @@
+# =============================================================================
+# VFM Ripple — VFM v1b adapter on top of ripple attention, scrya 54-clip overfit
+# =============================================================================
+# Strategy: vfm_ripple
+#   - VFM v1b noise adapter (self-attn + cross-attn to text, per-token μ,σ)
+#   - Joint audio-video (scrya talking-head dataset)
+#   - Ripple sparse attention (self_attn_type: ripple, activated by swap in trainer)
+#   - Bootstrap consistency distillation: trains f(z₁)≈f(z₂) for 1-shot stability
+#   - Noise replay buffer: prevents forgetting on the 54-clip dataset
+#
+# Resume from step 600 — adapter has structure, ready for distillation phase.
+#
+# Load order:
+#   1. Transformer loaded in bf16 → int8 quantized
+#   2. Ripple LoRA + VFM adapter loaded from step-600 checkpoint
+#   3. Attention blocks swapped to RippleVideoAttention
+#   4. Distillation + replay enabled from step 0 of this run (ramp over 100 steps)
+#
+# Sequence: 544×544×145 → S≈5491 tokens
+# =============================================================================
+
+model:
+  model_path: "/media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+  # Resume from VFM ripple step-600 (LoRA + adapter both trained)
+  load_checkpoint: "/media/2TB/output/vfm_ripple_scrya_overfit/checkpoints/lora_weights_step_00600.safetensors"
+  load_noise_adapter: "/media/2TB/output/vfm_ripple_scrya_overfit/checkpoints/noise_adapter_step_00600.safetensors"
+
+  self_attn_type: "ripple"
+  clifford_kwargs:
+    local_radius: 1
+    max_seq_len: 8192
+    kv_compress_mode: "none"
+
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_q"
+    - "to_k"
+    - "to_v"
+    - "to_out.0"
+
+training_strategy:
+  name: "vfm_ripple"
+
+  # VFM adapter (v1b architecture)
+  adapter_hidden_dim: 256
+  adapter_num_heads: 4
+  adapter_num_layers: 2
+  adapter_pos_dim: 128
+
+  # VFM loss hyperparameters (unchanged from baseline)
+  tau: 1.0
+  obs_noise_level: 0.2
+  alpha: 0.8
+  kl_weight: 0.001
+  kl_free_bits: 0.25
+  obs_loss_weight: 1.0
+  min_snr_gamma: 5.0
+
+  freeze_flow_map_steps: 0
+  ema_decay: 0.999
+
+  # Inverse problems
+  inverse_problem_weights:
+    t2v: 0.7
+    i2v: 0.3
+
+  # Audio
+  with_audio: true
+  audio_latents_dir: "audio_latents"
+  audio_loss_weight: 1.0
+
+  # First-frame conditioning
+  first_frame_conditioning_p: 0.1
+
+  # Reconstruction logging — more frequent so we can see 1-shot quality early
+  log_reconstructions: true
+  reconstruction_log_interval: 25
+  recon_log_height: 128      # resize from 544→128px before upload (~40× smaller)
+  recon_log_max_frames: 24   # subsample 145→24 frames
+  recon_log_video: true
+
+  # ── Bootstrap consistency distillation ──────────────────────────────────────
+  # Trains the flow map to produce the same video regardless of which z is drawn.
+  # Key metric: vfm/distill_cosine_sim should rise from ~0 → >0.7 within 300 steps.
+  # 100-step ramp prevents destabilising the adapter's existing structure.
+  self_distill_weight: 0.0       # disabled — 22B int8 leaves <1.5GB for teacher forward (needs 3GB)
+  self_distill_prob: 0.0
+  self_distill_warmup_steps: 100
+
+  # ── Noise replay buffer ──────────────────────────────────────────────────────
+  # 128 capacity = 2.4× the 54-clip dataset. Buffer fills by ~step 130,
+  # then every replay step sees a random past distribution.
+  # Start kl_weight low (0.05) — raise to 0.1 if replay_kl stays below 0.5.
+  replay_buffer_size: 128
+  replay_prob: 0.3
+  replay_kl_weight: 0.05
+
+  # Adaptive loss
+  adaptive_loss: true
+  adaptive_exclude_kl: true
+  adaptive_gamma: 1.0
+  adaptive_p: 0.5
+
+optimization:
+  learning_rate: 2.0e-4
+  adapter_learning_rate: 8.0e-4  # Higher than baseline — adapter needs to catch up fast
+  steps: 1400                    # 1400 more steps from step-600 = 2000 total
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params:
+    eta_min: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 20               # Short warmup — already warm from step-600
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"
+  load_text_encoder_in_8bit: true
+
+hardware:
+  devices:
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"
+    audio_vae: "cuda:1"
+    vocoder: "cuda:1"
+
+data:
+  preprocessed_data_root: "/media/12TB/scrya_realistic_photo"
+  num_dataloader_workers: 2
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+checkpoints:
+  interval: 100                  # More frequent — catch the distill_cosine_sim jump
+  keep_last_n: 5
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "ripple-attn"
+  entity: null
+  tags: ["vfm-ripple", "scrya", "audio-video", "145fr", "5090", "v1b-adapter", "distill", "replay"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/media/2TB/output/vfm_ripple_scrya_overfit"
