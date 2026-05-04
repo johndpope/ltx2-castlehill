@@ -14,6 +14,7 @@ from ltx_trainer.training_strategies.vfm_strategy import VFMTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1b import VFMv1bTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1c import VFMv1cTrainingConfig
 from ltx_trainer.training_strategies.isogen_strategy import IsoGenTrainingConfig
+from ltx_trainer.training_strategies.isogen_motionbricks_strategy import MotionBricksTrainingConfig
 from ltx_trainer.training_strategies.vfm_distill_strategy import VFMDistillConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1d import VFMv1dTrainingConfig
 from ltx_trainer.training_strategies.vfm_strategy_v1e import VFMv1eTrainingConfig
@@ -132,6 +133,7 @@ def _get_strategy_discriminator(v: dict | TrainingStrategyConfigBase) -> str:
 TrainingStrategyConfig = Annotated[
     Annotated[TextToVideoConfig, Tag("text_to_video")]
     | Annotated[VideoToVideoConfig, Tag("video_to_video")]
+    | Annotated[MotionBricksTrainingConfig, Tag("motionbricks")]
     | Annotated[SCDTrainingConfig, Tag("scd")]
     | Annotated[VFMSCDDistillConfig, Tag("vfm_scd_distill")]
     | Annotated[VFMSCDTrainingConfig, Tag("vfm_scd")]

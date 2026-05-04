@@ -41,9 +41,13 @@ from ltx_trainer.training_strategies.vfm_v4a_standalone import VFMv4aConfig, VFM
 from ltx_trainer.training_strategies.vfm_distill_strategy import VFMDistillConfig, VFMDistillStrategy
 from ltx_trainer.training_strategies.vfm_scd_distill_strategy import VFMSCDDistillConfig, VFMSCDDistillStrategy
 from ltx_trainer.training_strategies.isogen_strategy import IsoGenTrainingConfig, IsoGenTrainingStrategy
+from ltx_trainer.training_strategies.isogen_motionbricks_strategy import (
+    MotionBricksTrainingConfig,
+    MotionBricksTrainingStrategy,
+)
 
 # Type alias for all strategy config types
-TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | SCDTrainingConfig | VFMSCDDistillConfig | VFMSCDTrainingConfig | VFMTrainingConfig | VFMv1bTrainingConfig | VFMv1cTrainingConfig | VFMv1dTrainingConfig | VFMv1eTrainingConfig | VFMv1fTrainingConfig | VFMv12fTrainingConfig | VFMv1gTrainingConfig | VFMv1hTrainingConfig | VFMv2aTrainingConfig | VFMv2bTrainingConfig | DMDVFMv3aTrainingConfig | SelfEVFMv3bTrainingConfig | VFMv4aConfig | VFMDistillConfig | IsoGenTrainingConfig
+TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | SCDTrainingConfig | VFMSCDDistillConfig | VFMSCDTrainingConfig | VFMTrainingConfig | VFMv1bTrainingConfig | VFMv1cTrainingConfig | VFMv1dTrainingConfig | VFMv1eTrainingConfig | VFMv1fTrainingConfig | VFMv12fTrainingConfig | VFMv1gTrainingConfig | VFMv1hTrainingConfig | VFMv2aTrainingConfig | VFMv2bTrainingConfig | DMDVFMv3aTrainingConfig | SelfEVFMv3bTrainingConfig | VFMv4aConfig | VFMDistillConfig | IsoGenTrainingConfig | MotionBricksTrainingConfig
 
 __all__ = [
     "DEFAULT_FPS",
@@ -51,6 +55,8 @@ __all__ = [
     "IsoGenTrainingConfig",
     "IsoGenTrainingStrategy",
     "ModelInputs",
+    "MotionBricksTrainingConfig",
+    "MotionBricksTrainingStrategy",
     "SCDTrainingConfig",
     "SCDTrainingStrategy",
     "TextToVideoConfig",
@@ -114,6 +120,8 @@ def get_training_strategy(config: TrainingStrategyConfig) -> TrainingStrategy:
             strategy = TextToVideoStrategy(config)
         case VideoToVideoConfig():
             strategy = VideoToVideoStrategy(config)
+        case MotionBricksTrainingConfig():
+            strategy = MotionBricksTrainingStrategy(config)
         case SCDTrainingConfig():
             strategy = SCDTrainingStrategy(config)
         case VFMSCDDistillConfig():
